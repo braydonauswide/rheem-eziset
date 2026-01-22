@@ -1,0 +1,65 @@
+set_bathfill_preset:
+  name: Set Bath Fill Preset
+  description: Set or enable a bath fill preset slot (1-6) for Rheem EziSET.
+  target:
+    entity: {}
+  fields:
+    slot:
+      name: Slot
+      description: Preset slot number (1-6).
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 6
+          mode: box
+    enabled:
+      name: Enabled
+      description: Enable/disable this preset.
+      required: false
+      selector:
+        boolean: {}
+    name:
+      name: Name
+      description: Name to show for this preset.
+      required: false
+      selector:
+        text: {}
+    temp:
+      name: Temperature (°C)
+      description: Bath temperature for this preset.
+      required: false
+      selector:
+        number:
+          mode: box
+          step: 1
+    vol:
+      name: Volume (L)
+      description: Bath volume for this preset.
+      required: false
+      selector:
+        number:
+          mode: box
+          step: 1
+
+disable_bathfill_preset:
+  name: Disable Bath Fill Preset
+  description: Disable a bath fill preset slot.
+  target:
+    entity: {}
+  fields:
+    slot:
+      name: Slot
+      description: Preset slot number (1-6).
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 6
+          mode: box
+
+reset_bathfill_presets:
+  name: Reset Bath Fill Presets
+  description: Reset bath fill presets to defaults (Children 110L@39C, Adults 140L@43C; others disabled).
+  target:
+    entity: {}

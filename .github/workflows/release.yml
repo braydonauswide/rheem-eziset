@@ -1,0 +1,52 @@
+name: "Release"
+
+on:
+  release:
+    types:
+      - "published"
+
+permissions: {}
+
+jobs:
+  release:
+    name: "Release"
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: write
+    steps:
+      - name: "Checkout the repository"
+        uses: "actions/checkout@v4.1.7"
+
+      - name: "Adjust version number"
+        shell: "bash"
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          # Allow tags like v1.2.3, but write a clean semver to manifest.json
+          VERSION="${VERSION#v}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ.get("VERSION", "").lstrip("v")
+          if not version:
+              raise SystemExit("VERSION env var is empty")
+
+          manifest_path = Path(os.environ["GITHUB_WORKSPACE"]) / "custom_components" / "rheem_eziset" / "manifest.json"
+          data = json.loads(manifest_path.read_text(encoding="utf-8"))
+          data["version"] = version
+          manifest_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          PY
+        env:
+          VERSION: "${{ github.event.release.tag_name }}"
+
+      - name: "ZIP the integration directory"
+        shell: "bash"
+        run: |
+          cd "${{ github.workspace }}/custom_components/rheem_eziset"
+          zip rheem_eziset.zip -r ./
+
+      - name: "Upload the ZIP file to the release"
+        uses: softprops/action-gh-release@v2.0.6
+        with:
+          files: ${{ github.workspace }}/custom_components/rheem_eziset/rheem_eziset.zip

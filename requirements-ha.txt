@@ -1,0 +1,2 @@
+# Home Assistant runtime (requires Python >= 3.13.2 for this target).
+homeassistant==2026.1.0

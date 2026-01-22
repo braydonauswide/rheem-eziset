@@ -1,0 +1,52 @@
+name: "Auto Release"
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: "Create GitHub Release"
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: "Checkout the repository"
+        uses: "actions/checkout@v4.1.7"
+        with:
+          fetch-depth: 0
+
+      - name: "Compute version (CalVer)"
+        id: "version"
+        shell: "bash"
+        run: |
+          # CalVer-ish: YEAR.MONTH.COMMITCOUNT (semver-compatible numeric segments)
+          YEAR="$(date +%Y)"
+          MONTH="$(date +%-m)"
+          COUNT="$(git rev-list --count HEAD)"
+          VERSION="${YEAR}.${MONTH}.${COUNT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: "Check for existing tag"
+        id: "tag"
+        shell: "bash"
+        run: |
+          git fetch --tags --force
+          if git rev-parse "refs/tags/${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: "Create GitHub Release"
+        if: steps.tag.outputs.exists == 'false'
+        uses: "softprops/action-gh-release@v2.0.6"
+        with:
+          tag_name: "${{ steps.version.outputs.version }}"
+          name: "${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

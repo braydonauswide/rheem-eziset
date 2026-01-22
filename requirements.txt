@@ -1,0 +1,2 @@
+# Dev tools only. For running Home Assistant locally, see requirements-ha.txt (Python ≥3.13.2).
+-r requirements-dev.txt

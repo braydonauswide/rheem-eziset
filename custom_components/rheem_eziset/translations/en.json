@@ -1,0 +1,64 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Rheem Eziset Host",
+        "description": "Please provide the local IPv4 address of your Rheem EziSET water heater.",
+        "data": {
+          "host": "0.0.0.0"
+        }
+      }
+    },
+    "error": {
+      "connection": "Unable to connect to the device.",
+      "bathfill_engaged": "Bath fill is currently engaged; exit bath fill before editing options.",
+      "preset_missing_values": "Enabled presets must have a temperature and volume (set them above 0).",
+      "duplicate_presets": "Enabled presets must have unique temperature/volume pairs.",
+      "unknown": "Unexpected error while saving options. Please try again and check logs."
+    },
+    "abort": {
+      "host_already_exists": "Error. This host has already been configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Rheem Eziset Configuration",
+        "description": "Configure scan interval and bath fill presets. Warning: Read the documentation before changing these values.",
+        "data": {
+          "scan_interval": "Sensor scan interval in seconds (Default: 5)",
+          "bathfill_preset_1_enabled": "Enable Preset 1",
+          "bathfill_preset_1_name": "Preset 1 name",
+          "bathfill_preset_1_temp": "Preset 1 bath temperature",
+          "bathfill_preset_1_vol": "Preset 1 bath volume",
+          "bathfill_preset_2_enabled": "Enable Preset 2",
+          "bathfill_preset_2_name": "Preset 2 name",
+          "bathfill_preset_2_temp": "Preset 2 bath temperature",
+          "bathfill_preset_2_vol": "Preset 2 bath volume",
+          "bathfill_preset_3_enabled": "Enable Preset 3",
+          "bathfill_preset_3_name": "Preset 3 name",
+          "bathfill_preset_3_temp": "Preset 3 bath temperature",
+          "bathfill_preset_3_vol": "Preset 3 bath volume",
+          "bathfill_preset_4_enabled": "Enable Preset 4",
+          "bathfill_preset_4_name": "Preset 4 name",
+          "bathfill_preset_4_temp": "Preset 4 bath temperature",
+          "bathfill_preset_4_vol": "Preset 4 bath volume",
+          "bathfill_preset_5_enabled": "Enable Preset 5",
+          "bathfill_preset_5_name": "Preset 5 name",
+          "bathfill_preset_5_temp": "Preset 5 bath temperature",
+          "bathfill_preset_5_vol": "Preset 5 bath volume",
+          "bathfill_preset_6_enabled": "Enable Preset 6",
+          "bathfill_preset_6_name": "Preset 6 name",
+          "bathfill_preset_6_temp": "Preset 6 bath temperature",
+          "bathfill_preset_6_vol": "Preset 6 bath volume"
+        }
+      }
+    },
+    "error": {
+      "bathfill_engaged": "Bath fill is currently engaged; exit bath fill before editing options.",
+      "preset_missing_values": "Enabled presets must have a temperature and volume (set them above 0).",
+      "duplicate_presets": "Enabled presets must have unique temperature/volume pairs.",
+      "unknown": "Unexpected error while saving options. Please try again and check logs."
+    }
+  }
+}
