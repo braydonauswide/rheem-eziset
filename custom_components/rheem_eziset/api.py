@@ -117,8 +117,6 @@ class RheemEziSETApi:
         self._drain_task: asyncio.Task | None = None
         self._post_write_callback: Callable[[str], Awaitable[None]] | None = None
         self._last_release_attempt: float = 0.0
-        self._auto_exit_enabled: bool = False
-        self._auto_exit_latched_sid: int | None = None
         self._completion_latched: bool = False
         self._bathfill_latched: bool = False
         # When True, treat completion markers (state==3 / mode==35) as cleared until the next bath fill start.
@@ -311,12 +309,6 @@ class RheemEziSETApi:
     def set_post_write_callback(self, callback: Callable[[str], Awaitable[None]]) -> None:
         """Register a callback to be invoked after a queued write succeeds."""
         self._post_write_callback = callback
-
-    def set_auto_exit_enabled(self, enabled: bool) -> None:
-        """Enable/disable auto-exit behavior."""
-        self._auto_exit_enabled = enabled
-        if not enabled:
-            self._auto_exit_latched_sid = None
 
     def _op_ready(self, op: str, payload: dict[str, Any], info: Mapping[str, Any]) -> tuple[bool, str | None, bool]:
         """Return (ready, reason, drop) for a pending op given cached info."""
@@ -970,7 +962,6 @@ class RheemEziSETApi:
                             },
                         )
 
-        # Auto-exit on completion (optional)
         mode_val = to_int(merged.get("mode"))
         state_val = to_int(merged.get("state"))
         sid_val = to_int(merged.get("sid"))
@@ -998,58 +989,6 @@ class RheemEziSETApi:
         if self._ignore_completion_state and not device_bathfill_active and flow_val in (0, None):
             merged["fillPercent"] = 0.0
             fill_percent = 0.0
-
-        engaged_for_exit = self._bathfill_engaged(merged)
-        if not engaged_for_exit:
-            self._auto_exit_latched_sid = None
-        elif self._auto_exit_enabled:
-            if completion and fill_percent is None and flow_val in (0, None):
-                merged["fillPercent"] = 100.0
-                fill_percent = 100.0
-
-            should_auto_exit = (
-                fill_percent is not None
-                and fill_percent >= 80.0
-                and flow_val in (0, None)
-            ) or (completion and flow_val in (0, None))
-
-            self._log_action(
-                "auto_exit",
-                "consider",
-                control_seq_id="auto_exit",
-                extra={
-                    "sid": sid_val,
-                    "mode": mode_val,
-                    "state": state_val,
-                    "fillPercent": fill_percent,
-                    "flow": flow_val,
-                    "auto_exit_enabled": self._auto_exit_enabled,
-                    "completion": completion,
-                    "should_auto_exit": should_auto_exit,
-                },
-            )
-
-            if should_auto_exit and sid_val not in (None, 0) and self._auto_exit_latched_sid != sid_val:
-                self._auto_exit_latched_sid = sid_val
-                self._log_action(
-                    "auto_exit",
-                    "enqueue",
-                    control_seq_id="auto_exit",
-                    extra={
-                        "sid": sid_val,
-                        "mode": mode_val,
-                        "state": state_val,
-                        "fillPercent": fill_percent,
-                        "flow": flow_val,
-                    },
-                )
-                self._enqueue_write(
-                    "bathfill_cancel",
-                    {
-                        "origin": "system",
-                        "entity_id": None,
-                    },
-                )
 
         self._schedule_drain()
         return merged
@@ -1806,6 +1745,37 @@ class RheemEziSETApi:
         info = await self._enqueue_request("getInfo.cgi")
         self._last_info = info
 
+        # Poll flow every 30 seconds until tap is closed (flow = 0)
+        # This matches Rheem mobile app behavior - it detects tap closure quickly
+        flow_val = to_float(info.get("flow"))
+        max_wait_s = 3600  # Maximum 1 hour wait
+        poll_interval_s = 30.0  # Check every 30 seconds
+        start_time = time.monotonic()
+
+        while flow_val not in (0, None):
+            elapsed = time.monotonic() - start_time
+            if elapsed >= max_wait_s:
+                raise ConditionErrorMessage(
+                    type="flow_active_timeout",
+                    message=f"{DOMAIN} - Flow still active after {max_wait_s}s; cannot cancel bath fill until tap is closed (flow={flow_val} L/min).",
+                )
+
+            # Wait 30 seconds before next check
+            await asyncio.sleep(poll_interval_s)
+
+            # Get fresh device state to check flow
+            info = await self._enqueue_request("getInfo.cgi", control_seq_id="bathfill_exit_flow_check")
+            self._last_info = info
+            flow_val = to_float(info.get("flow"))
+
+            # Log progress
+            self._log_action(
+                "bathfill_cancel",
+                "waiting_for_flow",
+                control_seq_id="bathfill_exit",
+                extra={"flow": flow_val, "elapsed_s": int(elapsed)},
+            )
+
         engaged = self._bathfill_engaged(info)
         if not engaged:
             return
@@ -1857,7 +1827,6 @@ class RheemEziSETApi:
                 )
             self._bathfill_latched = False
             self._completion_latched = False
-            self._auto_exit_latched_sid = None
             self._ignore_completion_state = True
 
             if self._pending_restore_temp is not None:

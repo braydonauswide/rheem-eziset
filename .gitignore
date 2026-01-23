@@ -26,3 +26,17 @@ coverage.xml
 config/*
 !config/configuration.yaml
 custom_components/rheem_eziset/debug.log
+
+# Development files (not needed for production users)
+.devcontainer.json
+.pre-commit-config.yaml
+.ruff.toml
+scripts/develop
+scripts/setup
+scripts/lint
+scripts/update_version.py
+requirements-dev.txt
+requirements.txt
+requirements-ha.txt
+CONTRIBUTING.md
+agents.md

@@ -41,6 +41,38 @@ jobs:
             echo "exists=false" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: "Update version in all files"
+        if: steps.tag.outputs.exists == 'false'
+        shell: "bash"
+        run: |
+          python3 scripts/update_version.py "${{ steps.version.outputs.version }}"
+
+      - name: "Commit version updates"
+        if: steps.tag.outputs.exists == 'false'
+        shell: "bash"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No version changes to commit"
+          else
+            git commit -m "Bump version to ${{ steps.version.outputs.version }}"
+          fi
+
+      - name: "Create and push tag"
+        if: steps.tag.outputs.exists == 'false'
+        shell: "bash"
+        run: |
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: "Push version commit"
+        if: steps.tag.outputs.exists == 'false'
+        shell: "bash"
+        run: |
+          git push origin main
+
       - name: "Create GitHub Release"
         if: steps.tag.outputs.exists == 'false'
         uses: "softprops/action-gh-release@v2.0.6"

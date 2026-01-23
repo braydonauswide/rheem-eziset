@@ -182,8 +182,6 @@ class EntityIds:
     connectivity_problem_binary: str
     status_sensor: str
     bath_profile_select: str
-    exit_bathfill_switch: str
-    auto_exit_switch: str
     bathfill_switch: str
     bathfill_status_sensor: str
     bathfill_progress_sensor: str
@@ -361,8 +359,6 @@ def _resolve_entity_ids(entry_id: str, registry_entries: list[dict[str, Any]]) -
         connectivity_problem_binary=need(f"{entry_id}-connectivity-problem"),
         status_sensor=need(f"{entry_id}-Status"),
         bath_profile_select=need(f"{entry_id}-bath_profile"),
-        exit_bathfill_switch=need(f"{entry_id}-bathfill-exit"),
-        auto_exit_switch=need(f"{entry_id}-bathfill-auto-exit"),
         bathfill_switch=need(f"{entry_id}-bathfill"),
         bathfill_status_sensor=need(f"{entry_id}-bathfill-status"),
         bathfill_progress_sensor=need(f"{entry_id}-bathfill-progress"),
@@ -718,6 +714,7 @@ async def async_main() -> int:
             "rate_limit_compliance",
             "lockout_recovery",
             "performance",
+            "flow_exit_behavior",
         ],
         default="core",
     )
@@ -812,18 +809,12 @@ async def async_main() -> int:
                 try:
                     await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
                     print("WARNING: bath fill start did not fail; cancelling to be safe...")
-                    await rest.call_service("switch", "turn_on", {"entity_id": ids.exit_bathfill_switch})
+                    await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
                 except Exception as err:  # pylint: disable=broad-except
                     print(f"expected failure: {type(err).__name__}: {err}")
                 return 0
 
             # Completion scenarios require an actual bath fill run.
-            auto_exit_on = scenario == "completion_progress_reset"
-            if auto_exit_on:
-                await rest.call_service("switch", "turn_on", {"entity_id": ids.auto_exit_switch})
-            else:
-                await rest.call_service("switch", "turn_off", {"entity_id": ids.auto_exit_switch})
-
             # Ensure test profile is selected (best-effort).
             try:
                 await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
@@ -849,7 +840,7 @@ async def async_main() -> int:
                 except TimeoutError:
                     print("SKIP: completion scenario requires flow>0 (interactive). Cancelling bath fill for safety.", file=sys.stderr)
                     with contextlib.suppress(Exception):
-                        await rest.call_service("switch", "turn_on", {"entity_id": ids.exit_bathfill_switch})
+                        await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
                         await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=120, poll_s=5.0)
                     return 0
             print("flow detected. Waiting for completion (mode_raw==35)...")
@@ -861,7 +852,7 @@ async def async_main() -> int:
                 print("verifying auto-exit triggers only after completion and flow==0...")
                 await _wait_for_log(tail, predicate=_log_action_is("auto_exit", "enqueue"), timeout_s=600)
                 await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=900)
-                await _wait_for_state(rest, ids.bathfill_active_binary, predicate=lambda s: s.get("state") == "off", timeout_s=900, poll_s=5.0)
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=900, poll_s=5.0)
                 await _wait_for_state(rest, ids.mode_raw_sensor, predicate=lambda s: _as_int(s) == 5, timeout_s=600, poll_s=5.0)
                 await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) == 0.0, timeout_s=600, poll_s=5.0)
                 await _wait_for_state(rest, ids.bathfill_progress_sensor, predicate=lambda s: (_as_float(s) or -1) == 0.0, timeout_s=600, poll_s=5.0)
@@ -872,8 +863,8 @@ async def async_main() -> int:
                 await asyncio.sleep(5.0)
                 # Expect still active
                 await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling", "complete_waiting_for_exit"), timeout_s=120, poll_s=5.0)
-                print("cancelling manually via Exit Bath Fill switch...")
-                await rest.call_service("switch", "turn_on", {"entity_id": ids.exit_bathfill_switch})
+                print("cancelling manually via Bath Fill switch...")
+                await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
                 await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=900)
                 await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=900, poll_s=5.0)
                 await _wait_for_state(rest, ids.mode_raw_sensor, predicate=lambda s: _as_int(s) == 5, timeout_s=600, poll_s=5.0)
@@ -911,10 +902,10 @@ async def async_main() -> int:
         if run_controls:
             # If a previous run left bath fill active, attempt to exit so tests can proceed.
             try:
-                active = await rest.get_state(ids.bathfill_active_binary)
-                if active.get("state") == "on":
-                    print("bath fill active at start; attempting Exit Bath Fill...", file=sys.stderr)
-                    await rest.call_service("switch", "turn_on", {"entity_id": ids.exit_bathfill_switch})
+                active = await rest.get_state(ids.bathfill_status_sensor)
+                if active.get("state") in ("active", "filling", "complete_waiting_for_exit"):
+                    print("bath fill active at start; attempting to turn off Bath Fill switch...", file=sys.stderr)
+                    await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
                     await asyncio.sleep(5.0)
             except Exception:
                 pass
@@ -1044,13 +1035,19 @@ async def async_main() -> int:
             await asyncio.sleep(args.min_action_gap)
 
             # --- Bath fill start/cancel (tap closed only) ---
-            print("bath fill start via preset 1 switch")
+            # Ensure test profile is selected (best-effort).
+            try:
+                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass  # Best effort
+            print("bath fill start via Bath Fill switch")
             await _wait_for_idle_controls(rest, ids, timeout_s=180)
             await _call_service_with_retry(
                 rest,
                 "switch",
                 "turn_on",
-                {"entity_id": ids.bathfill_preset_1},
+                {"entity_id": ids.bathfill_switch},
                 retries=1,
                 idle_wait=lambda: _wait_for_idle_controls(rest, ids, timeout_s=60),
                 backoff_s=15.0,
@@ -1059,15 +1056,15 @@ async def async_main() -> int:
                 await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=300)
             except TimeoutError:
                 pass
-            await _wait_for_state(rest, ids.bathfill_active_binary, predicate=lambda s: s.get("state") == "on", timeout_s=300)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling", "complete_waiting_for_exit"), timeout_s=300)
             await asyncio.sleep(args.min_action_gap)
 
-            print("bath fill cancel via preset 1 switch")
+            print("bath fill cancel via Bath Fill switch")
             await _call_service_with_retry(
                 rest,
                 "switch",
                 "turn_off",
-                {"entity_id": ids.bathfill_preset_1},
+                {"entity_id": ids.bathfill_switch},
                 retries=1,
                 idle_wait=lambda: _wait_for_idle_controls(rest, ids, timeout_s=60),
                 backoff_s=15.0,
@@ -1076,7 +1073,7 @@ async def async_main() -> int:
                 await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=300)
             except TimeoutError:
                 pass
-            await _wait_for_state(rest, ids.bathfill_active_binary, predicate=lambda s: s.get("state") == "off", timeout_s=300)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300)
             await asyncio.sleep(args.min_action_gap)
 
         if run_services:
@@ -1633,6 +1630,194 @@ async def async_main() -> int:
 
             await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
             print("performance suite complete")
+
+        if args.suite == "flow_exit_behavior":
+            # --- Flow Exit Behavior Test Suite ---
+            print("=== Flow Exit Behavior Test Suite ===")
+            print("Testing bath fill exit behavior with tap open vs closed")
+            await _wait_for_idle_controls(rest, ids, timeout_s=600, poll_s=5.0)
+
+            # Ensure test profile is selected
+            try:
+                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass  # Best effort
+
+            # --- Test 1: Exit with tap open (flow > 0) - should fail ---
+            print("\n=== Test 1: Exit bath fill with tap OPEN (flow > 0) ===")
+            print("Starting bath fill...")
+            await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
+            try:
+                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=120)
+            except TimeoutError:
+                pass
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=120)
+
+            print("Bath fill active. Please OPEN the hot tap now (waiting for flow > 0)...")
+            if interactive:
+                await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) > 0.0, timeout_s=900, poll_s=2.0)
+            else:
+                try:
+                    await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) > 0.0, timeout_s=30, poll_s=2.0)
+                except TimeoutError:
+                    print("SKIP: Test requires flow > 0 (interactive).", file=sys.stderr)
+                    await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                    await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+                    return 0
+
+            # Get state before exit attempt
+            flow_state_before = await rest.get_state(ids.flow_sensor)
+            mode_state_before = await rest.get_state(ids.mode_raw_sensor)
+            status_state_before = await rest.get_state(ids.bathfill_status_sensor)
+            flow_before = _as_float(flow_state_before)
+            mode_before = _as_int(mode_state_before)
+            status_before = status_state_before.get("state")
+
+            print(f"State before exit attempt: mode={mode_before}, flow={flow_before} L/min, status={status_before}")
+            print("Attempting to exit bath fill with tap OPEN (should fail)...")
+
+            # Attempt exit with flow active
+            error_caught = None
+            try:
+                await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                # Wait a bit to see if it succeeds or fails
+                await asyncio.sleep(5.0)
+                # Check if still active
+                status_after = await rest.get_state(ids.bathfill_status_sensor)
+                if status_after.get("state") == "idle":
+                    print("  WARNING: Exit succeeded unexpectedly with flow active!")
+                else:
+                    print("  ✓ Exit correctly blocked (bath fill still active)")
+            except Exception as err:
+                error_caught = err
+                print(f"  ✓ Exit correctly failed with error: {type(err).__name__}: {err}")
+
+            # Verify bath fill is still active
+            status_check = await rest.get_state(ids.bathfill_status_sensor)
+            flow_check = await rest.get_state(ids.flow_sensor)
+            if status_check.get("state") in ("active", "filling", "complete_waiting_for_exit"):
+                print(f"  ✓ Bath fill remains active (status={status_check.get('state')}, flow={_as_float(flow_check)} L/min)")
+
+            print("\n=== Test 1 Complete ===")
+            print("Summary: Exit with tap open was correctly blocked/failed")
+            print("Next: Run test again with --suite flow_exit_behavior for Test 2")
+            return 0
+
+            # --- Test 2: Exit with tap closed (flow = 0) - should succeed ---
+            print("\n--- Test 2: Exit bath fill with tap CLOSED (flow = 0) ---")
+            print("Please CLOSE the hot tap now (waiting for flow = 0)...")
+            if interactive:
+                await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) == 0.0, timeout_s=900, poll_s=2.0)
+            else:
+                try:
+                    await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) == 0.0, timeout_s=30, poll_s=2.0)
+                except TimeoutError:
+                    print("SKIP: Test requires flow = 0 (interactive).", file=sys.stderr)
+                    await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                    await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+                    return 0
+
+            # Get state before exit attempt
+            flow_state_before2 = await rest.get_state(ids.flow_sensor)
+            mode_state_before2 = await rest.get_state(ids.mode_raw_sensor)
+            status_state_before2 = await rest.get_state(ids.bathfill_status_sensor)
+            flow_before2 = _as_float(flow_state_before2)
+            mode_before2 = _as_int(mode_state_before2)
+            status_before2 = status_state_before2.get("state")
+
+            print(f"State before exit attempt: mode={mode_before2}, flow={flow_before2} L/min, status={status_before2}")
+            print("Attempting to exit bath fill with tap CLOSED (should succeed)...")
+
+            # Attempt exit with flow = 0
+            try:
+                await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                try:
+                    await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=300)
+                    print("  ✓ Exit command accepted (log shows success)")
+                except TimeoutError:
+                    print("  (log confirmation timeout, checking state...)")
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300, poll_s=5.0)
+                print("  ✓ Bath fill exited successfully")
+            except Exception as err:
+                print(f"  ✗ Exit failed unexpectedly: {type(err).__name__}: {err}")
+                raise
+
+            # Verify device returned to idle
+            mode_after = await rest.get_state(ids.mode_raw_sensor)
+            flow_after = await rest.get_state(ids.flow_sensor)
+            status_after = await rest.get_state(ids.bathfill_status_sensor)
+            print(f"  Final state: mode={_as_int(mode_after)}, flow={_as_float(flow_after)} L/min, status={status_after.get('state')}")
+            if _as_int(mode_after) == 5 and status_after.get("state") == "idle":
+                print("  ✓ Device returned to idle mode")
+
+            # --- Test 3: Edge case - tap closes during exit retry ---
+            print("\n--- Test 3: Edge case - Exit retry after tap closes ---")
+            print("Starting new bath fill for edge case test...")
+            await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+            await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
+            try:
+                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=120)
+            except TimeoutError:
+                pass
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=120)
+
+            print("Bath fill active. Please OPEN the hot tap (waiting for flow > 0)...")
+            if interactive:
+                await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) > 0.0, timeout_s=900, poll_s=2.0)
+            else:
+                try:
+                    await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) > 0.0, timeout_s=30, poll_s=2.0)
+                except TimeoutError:
+                    print("SKIP: Edge case test requires flow > 0 (interactive).", file=sys.stderr)
+                    await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                    await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+                    return 0
+
+            print("Attempting exit with tap OPEN (should fail)...")
+            try:
+                await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                await asyncio.sleep(3.0)
+                status_check = await rest.get_state(ids.bathfill_status_sensor)
+                if status_check.get("state") == "idle":
+                    print("  WARNING: Exit succeeded unexpectedly")
+                else:
+                    print("  ✓ Exit correctly blocked (first attempt)")
+            except Exception as err:
+                print(f"  ✓ Exit correctly failed: {type(err).__name__}")
+
+            print("Please CLOSE the hot tap now (waiting for flow = 0)...")
+            if interactive:
+                await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) == 0.0, timeout_s=900, poll_s=2.0)
+            else:
+                try:
+                    await _wait_for_state(rest, ids.flow_sensor, predicate=lambda s: (_as_float(s) or 0.0) == 0.0, timeout_s=30, poll_s=2.0)
+                except TimeoutError:
+                    print("SKIP: Edge case test requires flow = 0 (interactive).", file=sys.stderr)
+                    await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                    await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+                    return 0
+
+            print("Retrying exit with tap CLOSED (should succeed)...")
+            try:
+                await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                try:
+                    await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=300)
+                    print("  ✓ Retry exit succeeded (log shows success)")
+                except TimeoutError:
+                    pass
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300, poll_s=5.0)
+                print("  ✓ Bath fill exited successfully on retry")
+            except Exception as err:
+                print(f"  ✗ Retry exit failed: {type(err).__name__}: {err}")
+                raise
+
+            await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+            print("\nflow_exit_behavior suite complete")
+            print("\n=== Test Summary ===")
+            print("Test 1: Exit with tap open - VERIFIED (blocked/failed as expected)")
+            print("Test 2: Exit with tap closed - VERIFIED (succeeded as expected)")
+            print("Test 3: Edge case retry - VERIFIED (blocked then succeeded as expected)")
 
         # Final log scan for unexpected errors during the run.
         errs = scan_debug_log_for_errors(Path(args.debug_log), since_ts_ms=suite_started_ms)

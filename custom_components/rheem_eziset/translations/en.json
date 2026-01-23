@@ -11,7 +11,7 @@
     },
     "error": {
       "connection": "Unable to connect to the device.",
-      "bathfill_engaged": "Bath fill is currently engaged; exit bath fill before editing options.",
+      "bathfill_engaged": "Bath fill is currently engaged; turn off bath fill before editing options.",
       "preset_missing_values": "Enabled presets must have a temperature and volume (set them above 0).",
       "duplicate_presets": "Enabled presets must have unique temperature/volume pairs.",
       "unknown": "Unexpected error while saving options. Please try again and check logs."
@@ -55,7 +55,7 @@
       }
     },
     "error": {
-      "bathfill_engaged": "Bath fill is currently engaged; exit bath fill before editing options.",
+      "bathfill_engaged": "Bath fill is currently engaged; turn off bath fill before editing options.",
       "preset_missing_values": "Enabled presets must have a temperature and volume (set them above 0).",
       "duplicate_presets": "Enabled presets must have unique temperature/volume pairs.",
       "unknown": "Unexpected error while saving options. Please try again and check logs."
