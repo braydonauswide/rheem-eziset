@@ -31,6 +31,7 @@ custom_components/rheem_eziset/debug.log
 .devcontainer.json
 .pre-commit-config.yaml
 .ruff.toml
+.cursor/
 scripts/develop
 scripts/setup
 scripts/lint
