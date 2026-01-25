@@ -9,9 +9,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: "auto-release-${{ github.ref }}"
+  cancel-in-progress: false
+
 jobs:
   release:
     name: "Create GitHub Release"
+    if: github.actor != 'github-actions[bot]'
     runs-on: "ubuntu-latest"
     steps:
       - name: "Checkout the repository"
@@ -19,23 +24,72 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "Compute version (CalVer)"
-        id: "version"
+      - name: "Compute versions (SemVer patch bump)"
+        id: "versions"
         shell: "bash"
         run: |
-          # CalVer-ish: YEAR.MONTH.COMMITCOUNT (semver-compatible numeric segments)
-          YEAR="$(date +%Y)"
-          MONTH="$(date +%-m)"
-          COUNT="$(git rev-list --count HEAD)"
-          VERSION="${YEAR}.${MONTH}.${COUNT}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import json
+          from pathlib import Path
 
-      - name: "Check for existing tag"
-        id: "tag"
+          manifest = Path("custom_components") / "rheem_eziset" / "manifest.json"
+          data = json.loads(manifest.read_text(encoding="utf-8"))
+          current = (data.get("version") or "").strip()
+          parts = current.split(".")
+          if len(parts) != 3 or not all(p.isdigit() for p in parts):
+              raise SystemExit(f"Invalid manifest.json version: {current!r}")
+          major, minor, patch = map(int, parts)
+          next_version = f"{major}.{minor}.{patch + 1}"
+
+          print(f"current={current}")
+          print(f"next={next_version}")
+          PY
+
+      - name: "Fetch tags"
         shell: "bash"
         run: |
           git fetch --tags --force
-          if git rev-parse "refs/tags/${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+
+      - name: "Check for existing current tag"
+        id: "current_tag"
+        shell: "bash"
+        run: |
+          if git rev-parse "refs/tags/${{ steps.versions.outputs.current }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: "Check for existing GitHub release (current)"
+        id: "current_release"
+        if: steps.current_tag.outputs.exists == 'true'
+        shell: "bash"
+        run: |
+          RELEASE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.versions.outputs.current }}")
+          if [ "$RELEASE_RESPONSE" = "200" ]; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: "Create GitHub Release (current)"
+        if: steps.current_tag.outputs.exists == 'true' && steps.current_release.outputs.exists == 'false'
+        uses: "softprops/action-gh-release@v2.0.6"
+        with:
+          tag_name: "${{ steps.versions.outputs.current }}"
+          name: "${{ steps.versions.outputs.current }}"
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Check for existing next tag"
+        id: "tag"
+        shell: "bash"
+        run: |
+          if git rev-parse "refs/tags/${{ steps.versions.outputs.next }}" >/dev/null 2>&1; then
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           else
             echo "exists=false" >> "${GITHUB_OUTPUT}"
@@ -45,7 +99,7 @@ jobs:
         if: steps.tag.outputs.exists == 'false'
         shell: "bash"
         run: |
-          python3 scripts/update_version.py "${{ steps.version.outputs.version }}"
+          python3 scripts/update_version.py "${{ steps.versions.outputs.next }}"
 
       - name: "Commit version updates"
         if: steps.tag.outputs.exists == 'false'
@@ -57,7 +111,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No version changes to commit"
           else
-            git commit -m "Bump version to ${{ steps.version.outputs.version }}"
+            git commit -m "Bump version to ${{ steps.versions.outputs.next }}"
           fi
 
       - name: "Push version commit"
@@ -70,8 +124,8 @@ jobs:
         if: steps.tag.outputs.exists == 'false'
         shell: "bash"
         run: |
-          git tag "${{ steps.version.outputs.version }}"
-          git push origin "${{ steps.version.outputs.version }}"
+          git tag "${{ steps.versions.outputs.next }}"
+          git push origin "${{ steps.versions.outputs.next }}"
 
       - name: "Check for existing GitHub release"
         id: "release"
@@ -80,7 +134,7 @@ jobs:
           RELEASE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.version }}")
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.versions.outputs.next }}")
           if [ "$RELEASE_RESPONSE" = "200" ]; then
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           else
@@ -91,8 +145,8 @@ jobs:
         if: steps.release.outputs.exists == 'false'
         uses: "softprops/action-gh-release@v2.0.6"
         with:
-          tag_name: "${{ steps.version.outputs.version }}"
-          name: "${{ steps.version.outputs.version }}"
+          tag_name: "${{ steps.versions.outputs.next }}"
+          name: "${{ steps.versions.outputs.next }}"
           generate_release_notes: true
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

@@ -58,6 +58,10 @@ While this integration does not allow you to do anything which the app lets you 
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=braydonauswide&repository=rheem-eziset&category=integration)
 
+Notes on versions in HACS:
+- HACS lists the **default branch** plus (up to) the **5 latest GitHub releases** for version selection.
+- If you see a message like "Commit `<hash>` will be downloaded", it usually means this repository has **no GitHub releases** (or HACS hasn’t refreshed its cache yet).
+
 ### Manual Installation
 
 1. Using the tool of choice open the directory (folder) for your HA configuration (where you find `configuration.yaml`).
