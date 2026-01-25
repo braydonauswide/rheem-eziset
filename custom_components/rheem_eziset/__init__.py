@@ -121,13 +121,20 @@ async def _ensure_bath_profile_input_select(
     
     # Try to access input_select storage collection
     try:
-        # Method 1: Access through component's async_setup result
+        # Ensure input_select is loaded and wait for it to initialize
         setup_result = await async_setup_component(hass, "input_select", {})
         if not setup_result:
             LOGGER.warning("%s - input_select component setup returned False", DOMAIN)
         
         # Wait a moment for storage collection to initialize
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)
+        
+        # Try to get the storage collection manager directly
+        try:
+            from homeassistant.components.input_select import async_setup_entry as input_select_setup
+            # The storage collection might be accessible through the component's setup
+        except ImportError:
+            pass
         
         # Access the input_select integration's storage collection
         # Try multiple possible locations
@@ -206,8 +213,18 @@ async def _ensure_bath_profile_input_select(
                         "initial": options[0] if options else None,
                         "icon": "mdi:bathtub",
                     }
-                    await storage_collection(item_data)
-                    LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
+                    try:
+                        await storage_collection(item_data)
+                        LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
+                    except Exception as create_err:  # pylint: disable=broad-except
+                        LOGGER.error(
+                            "%s - Storage collection create_item failed: %s (item_data: %s)",
+                            DOMAIN,
+                            create_err,
+                            item_data,
+                            exc_info=True,
+                        )
+                        raise
             else:
                 # Log available attributes for debugging
                 attrs = [attr for attr in dir(input_select_data) if not attr.startswith("__")]
