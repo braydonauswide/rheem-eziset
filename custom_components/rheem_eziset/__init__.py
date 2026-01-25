@@ -121,40 +121,66 @@ async def _ensure_bath_profile_input_select(
     
     # Try to access input_select storage collection
     try:
+        # Method 1: Access through component's async_setup result
+        setup_result = await async_setup_component(hass, "input_select", {})
+        if not setup_result:
+            LOGGER.warning("%s - input_select component setup returned False", DOMAIN)
+        
+        # Wait a moment for storage collection to initialize
+        await asyncio.sleep(0.1)
+        
         # Access the input_select integration's storage collection
-        # The storage collection is typically in hass.data["input_select"] after setup
+        # Try multiple possible locations
+        input_select_data = None
+        storage_collection = None
+        
+        # Try hass.data["input_select"]
         input_select_data = hass.data.get("input_select")
         
+        # Try importing and accessing via DOMAIN constant
         if not input_select_data:
-            # Try importing and accessing directly
             try:
                 from homeassistant.components.input_select import DOMAIN as INPUT_SELECT_DOMAIN
                 input_select_data = hass.data.get(INPUT_SELECT_DOMAIN)
             except ImportError:
                 pass
         
+        # Try accessing through entity component
+        if not input_select_data:
+            try:
+                from homeassistant.helpers import entity_component
+                ec = entity_component.async_get_entity_component(hass, "input_select")
+                if ec:
+                    input_select_data = ec
+            except (ImportError, AttributeError):
+                pass
+        
         if input_select_data:
-            # Look for storage collection with async_create_item method
-            storage_collection = None
+            LOGGER.debug("%s - Found input_select_data: %s (type: %s)", DOMAIN, type(input_select_data).__name__, type(input_select_data))
             
+            # Look for storage collection with async_create_item method
             # Try direct access first
             if hasattr(input_select_data, "async_create_item") and callable(input_select_data.async_create_item):
                 storage_collection = input_select_data.async_create_item
+                LOGGER.debug("%s - Found async_create_item as direct method", DOMAIN)
             elif hasattr(input_select_data, "_storage_collection"):
                 storage_collection_obj = getattr(input_select_data, "_storage_collection")
                 if hasattr(storage_collection_obj, "async_create_item"):
                     storage_collection = storage_collection_obj.async_create_item
+                    LOGGER.debug("%s - Found async_create_item in _storage_collection", DOMAIN)
             elif hasattr(input_select_data, "storage_collection"):
                 storage_collection_obj = getattr(input_select_data, "storage_collection")
                 if hasattr(storage_collection_obj, "async_create_item"):
                     storage_collection = storage_collection_obj.async_create_item
+                    LOGGER.debug("%s - Found async_create_item in storage_collection", DOMAIN)
             else:
-                # Try iterating through attributes
+                # Try iterating through attributes to find storage collection
                 for attr_name in dir(input_select_data):
-                    if attr_name.startswith("_") and "storage" in attr_name.lower():
+                    if not attr_name.startswith("__") and ("storage" in attr_name.lower() or "collection" in attr_name.lower()):
                         attr = getattr(input_select_data, attr_name, None)
                         if attr and hasattr(attr, "async_create_item"):
                             storage_collection = attr.async_create_item
+                            LOGGER.debug("%s - Found async_create_item in %s", DOMAIN, attr_name)
                             break
             
             if storage_collection and callable(storage_collection):
@@ -183,10 +209,22 @@ async def _ensure_bath_profile_input_select(
                     await storage_collection(item_data)
                     LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
             else:
-                LOGGER.debug("%s - Storage collection methods found in input_select_data: %s", DOMAIN, [attr for attr in dir(input_select_data) if not attr.startswith("__")])
+                # Log available attributes for debugging
+                attrs = [attr for attr in dir(input_select_data) if not attr.startswith("__")]
+                LOGGER.warning(
+                    "%s - Storage collection async_create_item not found. Available attributes: %s",
+                    DOMAIN,
+                    attrs[:20],  # Limit to first 20
+                )
                 raise AttributeError("Storage collection async_create_item method not found")
         else:
-            LOGGER.debug("%s - input_select not in hass.data. Available keys: %s", DOMAIN, [k for k in hass.data.keys() if "input" in k.lower() or "select" in k.lower()])
+            # Log available keys for debugging
+            relevant_keys = [k for k in hass.data.keys() if "input" in str(k).lower() or "select" in str(k).lower()]
+            LOGGER.warning(
+                "%s - input_select not in hass.data. Relevant keys: %s",
+                DOMAIN,
+                relevant_keys,
+            )
             raise KeyError("input_select not in hass.data")
             
     except (AttributeError, KeyError, Exception) as err:  # pylint: disable=broad-except
