@@ -7,7 +7,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
+from .const import DOMAIN, LOGGER
 from .coordinator import RheemEziSETDataUpdateCoordinator
 from .entity import RheemEziSETEntity
 from .util import is_one, to_int, to_float
@@ -67,6 +67,13 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
         self._desired_on = True
         self._pending_until = time.monotonic() + 30
         self.async_write_ha_state()
+        # Fast temperature confirmation: poll once immediately (honors rate limits inside api)
+        try:
+            data = await self.coordinator.api.async_get_info_only()
+            if data:
+                self.coordinator.async_set_updated_data(data)
+        except Exception as err:  # pylint: disable=broad-except
+            LOGGER.debug("%s bathfill_start immediate poll failed: %s", DOMAIN, err)
         await self.coordinator.async_schedule_fast_refresh("bathfill_start")
 
     async def async_turn_off(self, **kwargs):

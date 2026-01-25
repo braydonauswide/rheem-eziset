@@ -14,6 +14,8 @@ from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.util import slugify
 
 from .api import RheemEziSETApi
 from .const import (
@@ -27,6 +29,81 @@ from .const import (
 )
 from .coordinator import RheemEziSETDataUpdateCoordinator
 from .util import to_int
+
+
+def _build_presets(entry: ConfigEntry) -> list[dict]:
+    """Build enabled preset list from options (fallback to defaults)."""
+    presets: list[dict] = []
+    opts = entry.options
+    use_defaults = not any(key.startswith("bathfill_preset_") for key in opts)
+
+    for idx in range(1, PRESET_SLOTS + 1):
+        defaults = DEFAULT_BATHFILL_PRESETS.get(idx) if use_defaults else None
+        enabled_raw = opts.get(f"bathfill_preset_{idx}_enabled")
+        enabled = bool(enabled_raw) if enabled_raw is not None else bool(defaults and defaults.get("enabled", False))
+        if not enabled:
+            continue
+        name = opts.get(f"bathfill_preset_{idx}_name") or (defaults.get("name") if defaults else f"Preset {idx}")
+        temp = to_int(opts.get(f"bathfill_preset_{idx}_temp")) or (defaults.get("temp") if defaults else None)
+        vol = to_int(opts.get(f"bathfill_preset_{idx}_vol")) or (defaults.get("vol") if defaults else None)
+        if temp is None or vol is None:
+            continue
+        presets.append({"name": str(name), "temp": int(temp), "vol": int(vol), "slot": idx})
+    return presets
+
+
+async def _ensure_bath_profile_input_select(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: RheemEziSETDataUpdateCoordinator
+) -> str | None:
+    """Create/update input_select for bath profiles and wire coordinator state."""
+    presets = _build_presets(entry)
+    options = [p["name"] for p in presets] or ["No presets configured"]
+    initial = options[0] if options else None
+
+    name = f"{entry.title} Bath Profile Input"
+    entity_id = f"input_select.{slugify(name)}"
+
+    # Remove any prior helper to keep options in sync
+    try:
+        await hass.services.async_call(
+            "input_select",
+            "remove",
+            {"entity_id": entity_id},
+            blocking=True,
+        )
+    except Exception:  # pylint: disable=broad-except
+        # Helper may not exist yet; ignore.
+        pass
+
+    await hass.services.async_call(
+        "input_select",
+        "create",
+        {
+            "name": name,
+            "options": options,
+            "initial": initial,
+            "icon": "mdi:bathtub",
+        },
+        blocking=True,
+    )
+
+    # Track coordinator state
+    coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
+    coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
+
+    # Listen for user selections to update coordinator state
+    async def _handle_state_change(event):
+        new_state = event.data.get("new_state")
+        if not new_state:
+            return
+        option = new_state.state
+        if option in options:
+            coordinator.bath_profile_current = option  # type: ignore[attr-defined]
+
+    unsub = async_track_state_change_event(hass, [entity_id], _handle_state_change)
+    entry.async_on_unload(unsub)
+
+    return entity_id
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -52,6 +129,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
+    # Create/refresh bath profile input_select helper (replaces old select entity)
+    await _ensure_bath_profile_input_select(hass, entry, coordinator)
+
     # Register services once
     if not hass.data[DOMAIN].get("services_registered"):
         _register_services(hass)
@@ -72,6 +152,19 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
     coordinator: RheemEziSETDataUpdateCoordinator = hass.data[DOMAIN].get(entry.entry_id)
     platforms = coordinator.platforms if coordinator else PLATFORMS
+
+    # Best-effort cleanup of helper
+    try:
+        name = f"{entry.title} Bath Profile Input"
+        entity_id = f"input_select.{slugify(name)}"
+        await hass.services.async_call(
+            "input_select",
+            "remove",
+            {"entity_id": entity_id},
+            blocking=True,
+        )
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.debug("%s - best-effort input_select removal failed", DOMAIN)
 
     # Cancel request worker task to prevent "Task was destroyed but it is pending" errors
     if coordinator and coordinator.api:

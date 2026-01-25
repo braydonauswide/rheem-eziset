@@ -17,7 +17,6 @@ PLATFORMS: list[Platform] = [
     Platform.NUMBER,
     Platform.WATER_HEATER,
     Platform.SWITCH,
-    Platform.SELECT,
 ]
 
 # SCAN INTERVAL
