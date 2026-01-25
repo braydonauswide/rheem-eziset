@@ -181,7 +181,7 @@ class EntityIds:
     s_timeout_sensor: str
     connectivity_problem_binary: str
     status_sensor: str
-    bath_profile_select: str
+    bath_profile_select: str | None  # Optional: old select entity or new input_select helper
     bathfill_switch: str
     bathfill_status_sensor: str
     bathfill_progress_sensor: str
@@ -339,16 +339,31 @@ def _try_int(val: Any) -> int | None:
 
 def _resolve_entity_ids(entry_id: str, registry_entries: list[dict[str, Any]]) -> EntityIds:
     by_unique: dict[str, str] = {}
+    by_entity_id: dict[str, dict[str, Any]] = {}
     for e in registry_entries:
         uid = e.get("unique_id")
         eid = e.get("entity_id")
         if uid and eid:
             by_unique[str(uid)] = str(eid)
+        if eid:
+            by_entity_id[str(eid)] = e
 
     def need(uid: str) -> str:
         if uid not in by_unique:
             raise RuntimeError(f"Missing entity for unique_id={uid!r}")
         return by_unique[uid]
+
+    def optional(uid: str) -> str | None:
+        return by_unique.get(uid)
+
+    # Try to find bath profile select (old) or input_select helper (new)
+    bath_profile = optional(f"{entry_id}-bath_profile")
+    if not bath_profile:
+        # Look for input_select entities that might be the bath profile helper
+        for eid, e in by_entity_id.items():
+            if eid.startswith("input_select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
+                bath_profile = eid
+                break
 
     return EntityIds(
         water_heater=need(f"{entry_id}-water-heater"),
@@ -358,7 +373,7 @@ def _resolve_entity_ids(entry_id: str, registry_entries: list[dict[str, Any]]) -
         s_timeout_sensor=need(f"{entry_id}-Session timeout"),
         connectivity_problem_binary=need(f"{entry_id}-connectivity-problem"),
         status_sensor=need(f"{entry_id}-Status"),
-        bath_profile_select=need(f"{entry_id}-bath_profile"),
+        bath_profile_select=bath_profile,
         bathfill_switch=need(f"{entry_id}-bathfill"),
         bathfill_status_sensor=need(f"{entry_id}-bathfill-status"),
         bathfill_progress_sensor=need(f"{entry_id}-bathfill-progress"),
@@ -841,7 +856,9 @@ async def async_main() -> int:
             # Completion scenarios require an actual bath fill run.
             # Ensure test profile is selected (best-effort).
             try:
-                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                if ids.bath_profile_select:
+                    domain = "input_select" if ids.bath_profile_select.startswith("input_select.") else "select"
+                    await rest.call_service(domain, "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
             except Exception:
                 pass
 
@@ -1061,7 +1078,9 @@ async def async_main() -> int:
             # --- Bath fill start/cancel (tap closed only) ---
             # Ensure test profile is selected (best-effort).
             try:
-                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                if ids.bath_profile_select:
+                    domain = "input_select" if ids.bath_profile_select.startswith("input_select.") else "select"
+                    await rest.call_service(domain, "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
                 await asyncio.sleep(1.0)
             except Exception:
                 pass  # Best effort
@@ -1178,7 +1197,9 @@ async def async_main() -> int:
             print("testing: start bath fill when already engaged")
             # Ensure a profile is selected
             try:
-                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                if ids.bath_profile_select:
+                    domain = "input_select" if ids.bath_profile_select.startswith("input_select.") else "select"
+                    await rest.call_service(domain, "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
                 await asyncio.sleep(1.0)
             except Exception:
                 pass  # Best effort
@@ -1242,7 +1263,9 @@ async def async_main() -> int:
             print("testing: start bath fill")
             # Ensure a profile is selected
             try:
-                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                if ids.bath_profile_select:
+                    domain = "input_select" if ids.bath_profile_select.startswith("input_select.") else "select"
+                    await rest.call_service(domain, "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
                 await asyncio.sleep(1.0)
             except Exception:
                 pass  # Best effort
@@ -1319,7 +1342,9 @@ async def async_main() -> int:
             print("testing: rapid sequential start attempts")
             # Ensure a profile is selected
             try:
-                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                if ids.bath_profile_select:
+                    domain = "input_select" if ids.bath_profile_select.startswith("input_select.") else "select"
+                    await rest.call_service(domain, "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
                 await asyncio.sleep(1.0)
             except Exception:
                 pass  # Best effort
@@ -1718,7 +1743,9 @@ async def async_main() -> int:
 
             # Ensure test profile is selected
             try:
-                await rest.call_service("select", "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
+                if ids.bath_profile_select:
+                    domain = "input_select" if ids.bath_profile_select.startswith("input_select.") else "select"
+                    await rest.call_service(domain, "select_option", {"entity_id": ids.bath_profile_select, "option": "test"})
                 await asyncio.sleep(1.0)
             except Exception:
                 pass  # Best effort
