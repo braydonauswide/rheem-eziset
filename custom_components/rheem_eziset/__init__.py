@@ -144,38 +144,45 @@ async def _ensure_bath_profile_input_select(
             creation_success = False
             try:
                 # Method 1: Try to access storage collection via input_select integration
-                if "input_select" in hass.data:
-                    input_select_data = hass.data["input_select"]
-                    # Look for storage collection or create methods
-                    for attr_name in ("async_create_item", "async_create", "_storage_collection", "storage_collection"):
-                        if hasattr(input_select_data, attr_name):
-                            attr = getattr(input_select_data, attr_name)
-                            if callable(attr):
-                                item_id = slugify(name)
-                                item_data = {
-                                    "id": item_id,
-                                    "name": name,
-                                    "options": displayed_options,
-                                    "initial": initial or (displayed_options[0] if displayed_options else None),
-                                    "icon": "mdi:bathtub",
-                                }
-                                await attr(item_data)
-                                LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
-                                creation_success = True
-                                break
-                            elif hasattr(attr, "async_create_item"):
-                                item_id = slugify(name)
-                                item_data = {
-                                    "id": item_id,
-                                    "name": name,
-                                    "options": displayed_options,
-                                    "initial": initial or (displayed_options[0] if displayed_options else None),
-                                    "icon": "mdi:bathtub",
-                                }
-                                await attr.async_create_item(item_data)
-                                LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
-                                creation_success = True
-                                break
+                # In HA, storage collections are typically stored in hass.data[DOMAIN]
+                # Try to import and use the input_select integration's storage collection
+                try:
+                    # Try to get the storage collection manager from input_select integration
+                    # The storage collection is typically in the integration's async_setup
+                    from homeassistant.components.input_select import DOMAIN as INPUT_SELECT_DOMAIN
+                    
+                    # Check if input_select has been set up and has storage collection
+                    if INPUT_SELECT_DOMAIN in hass.data:
+                        input_select_integration = hass.data[INPUT_SELECT_DOMAIN]
+                        
+                        # Look for the storage collection
+                        # Storage collections typically have async_create_item method
+                        storage_collection = None
+                        if hasattr(input_select_integration, "async_create_item"):
+                            storage_collection = input_select_integration.async_create_item
+                        elif hasattr(input_select_integration, "_storage_collection"):
+                            storage_collection = getattr(input_select_integration, "_storage_collection")
+                            if hasattr(storage_collection, "async_create_item"):
+                                storage_collection = storage_collection.async_create_item
+                        elif hasattr(input_select_integration, "storage_collection"):
+                            storage_collection = getattr(input_select_integration, "storage_collection")
+                            if hasattr(storage_collection, "async_create_item"):
+                                storage_collection = storage_collection.async_create_item
+                        
+                        if storage_collection and callable(storage_collection):
+                            item_id = slugify(name)
+                            item_data = {
+                                "id": item_id,
+                                "name": name,
+                                "options": displayed_options,
+                                "initial": initial or (displayed_options[0] if displayed_options else None),
+                                "icon": "mdi:bathtub",
+                            }
+                            await storage_collection(item_data)
+                            LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
+                            creation_success = True
+                except (ImportError, AttributeError, KeyError) as import_err:
+                    LOGGER.debug("%s - Could not import input_select integration: %s", DOMAIN, import_err)
                 
                 # Method 2: Try helper manager (if available)
                 if not creation_success:
