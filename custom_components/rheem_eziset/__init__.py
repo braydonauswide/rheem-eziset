@@ -17,7 +17,6 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import slugify
-from homeassistant.components import input_select
 
 from .api import RheemEziSETApi
 from .const import (
@@ -95,175 +94,109 @@ def _build_presets(entry: ConfigEntry) -> list[dict]:
 async def _ensure_bath_profile_input_select(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: RheemEziSETDataUpdateCoordinator
 ) -> str | None:
-    """Create/update input_select for bath profiles and wire coordinator state."""
-    # Ensure the input_select domain is loaded
-    result = await async_setup_component(hass, "input_select", {})
-    if not result:
-        LOGGER.warning("%s - Failed to load input_select helper domain", DOMAIN)
-
+    """Create/update input_select helper for bath profiles."""
+    # Ensure input_select domain is loaded
+    await async_setup_component(hass, "input_select", {})
+    
+    # Build presets and options
     presets = _build_presets(entry)
-    options = [p["label"] for p in presets]
-    placeholder = "No presets configured"
-    displayed_options = options or [placeholder]
-
-    name = f"{entry.title} Bath Profile Input"
-    entity_id = f"input_select.{slugify(name)}"
-    existing_state = hass.states.get(entity_id)
-
-    # Preserve the user's last choice when possible.
-    prior_option = getattr(coordinator, "bath_profile_current", None)
-    initial = None
-    for candidate in (existing_state.state if existing_state else None, prior_option):
-        if candidate in options:
-            initial = candidate
-            break
-    if initial is None and options:
-        initial = options[0]
-
-    try:
-        if existing_state:
-            # Entity exists, just update options
-            await hass.services.async_call(
-                "input_select",
-                "set_options",
-                {"entity_id": entity_id, "options": displayed_options},
-                blocking=True,
-            )
-            # Re-apply last selection if still valid, otherwise fall back to first option.
-            if initial or displayed_options:
-                await hass.services.async_call(
-                    "input_select",
-                    "select_option",
-                    {"entity_id": entity_id, "option": initial or displayed_options[0]},
-                    blocking=True,
-                )
-        else:
-            # Entity doesn't exist - create via storage collection API
-            # In HA 2026.1+, input_select uses storage collections
-            # Try multiple methods to access and create the helper
-            creation_success = False
-            try:
-                # Method 1: Try to access storage collection via input_select integration
-                # In HA, storage collections are typically stored in hass.data[DOMAIN]
-                # Try to import and use the input_select integration's storage collection
-                try:
-                    # Try to get the storage collection manager from input_select integration
-                    # The storage collection is typically in the integration's async_setup
-                    from homeassistant.components.input_select import DOMAIN as INPUT_SELECT_DOMAIN
-                    
-                    # Check if input_select has been set up and has storage collection
-                    if INPUT_SELECT_DOMAIN in hass.data:
-                        input_select_integration = hass.data[INPUT_SELECT_DOMAIN]
-                        
-                        # Look for the storage collection
-                        # Storage collections typically have async_create_item method
-                        storage_collection = None
-                        if hasattr(input_select_integration, "async_create_item"):
-                            storage_collection = input_select_integration.async_create_item
-                        elif hasattr(input_select_integration, "_storage_collection"):
-                            storage_collection = getattr(input_select_integration, "_storage_collection")
-                            if hasattr(storage_collection, "async_create_item"):
-                                storage_collection = storage_collection.async_create_item
-                        elif hasattr(input_select_integration, "storage_collection"):
-                            storage_collection = getattr(input_select_integration, "storage_collection")
-                            if hasattr(storage_collection, "async_create_item"):
-                                storage_collection = storage_collection.async_create_item
-                        
-                        if storage_collection and callable(storage_collection):
-                            item_id = slugify(name)
-                            item_data = {
-                                "id": item_id,
-                                "name": name,
-                                "options": displayed_options,
-                                "initial": initial or (displayed_options[0] if displayed_options else None),
-                                "icon": "mdi:bathtub",
-                            }
-                            await storage_collection(item_data)
-                            LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
-                            creation_success = True
-                except (ImportError, AttributeError, KeyError) as import_err:
-                    LOGGER.debug("%s - Could not import input_select integration: %s", DOMAIN, import_err)
-                
-                # Method 2: Try helper manager (if available)
-                if not creation_success:
-                    helper_manager = hass.data.get("helper_manager")
-                    if helper_manager and hasattr(helper_manager, "async_create"):
-                        await helper_manager.async_create(
-                            domain="input_select",
-                            name=name,
-                            config={
-                                "options": displayed_options,
-                                "initial": initial or (displayed_options[0] if displayed_options else None),
-                                "icon": "mdi:bathtub",
-                            },
-                        )
-                        LOGGER.info("%s - Created input_select helper via helper manager: %s", DOMAIN, entity_id)
-                        creation_success = True
-                
-                if not creation_success:
-                    # Storage collection not accessible - cannot create programmatically
-                    LOGGER.warning(
-                        "%s - Cannot access input_select storage collection to create helper programmatically. "
-                        "Bath fill will work using coordinator state, but Bath Profile selection helper must be created manually. "
-                        "Go to: Settings > Devices & Services > Helpers > Add Helper > Dropdown. "
-                        "Name: '%s', Options: %s, Initial: %s, Icon: mdi:bathtub",
-                        DOMAIN,
-                        name,
-                        displayed_options,
-                        initial or displayed_options[0] if displayed_options else None,
-                    )
-                    # Don't raise - allow integration to continue without helper
-                    # Set coordinator state so bath fill will work
-                    current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial and presets else None
-                    coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
-                    coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
-                    coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
-                    return None
-            except Exception as err:  # pylint: disable=broad-except
-                # All creation methods failed - log clear instructions and continue without helper
-                LOGGER.warning(
-                    "%s - Cannot create input_select helper programmatically (%s). "
-                    "Bath fill will work using coordinator state, but Bath Profile selection helper must be created manually. "
-                    "Go to: Settings > Devices & Services > Helpers > Add Helper > Dropdown. "
-                    "Name: '%s', Options: %s, Initial: %s, Icon: mdi:bathtub",
-                    DOMAIN,
-                    err,
-                    name,
-                    displayed_options,
-                    initial or displayed_options[0] if displayed_options else None,
-                )
-                # Don't raise - allow integration to continue without helper
-                # Set coordinator state even though helper creation failed
-                current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial and presets else None
-                coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
-                coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
-                coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
-                return None
-        LOGGER.debug(
-            "%s input_select helper ready entity_id=%s options=%s initial=%s existing=%s",
-            DOMAIN,
-            entity_id,
-            displayed_options,
-            initial,
-            bool(existing_state),
-        )
-    except Exception as err:  # pylint: disable=broad-except
-        LOGGER.error("%s - Failed to create/update input_select helper: %s", DOMAIN, err, exc_info=True)
-        # Still set coordinator state even if helper creation failed
-        # This allows the switch to work even if input_select is unavailable
-        current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial and presets else None
+    options = [p.get("label", p.get("name", "")) for p in presets if p.get("label")]
+    if not options and presets:
+        options = [p.get("name", "") for p in presets if p.get("name")]
+    
+    if not options:
+        LOGGER.warning("%s - No presets available for input_select helper", DOMAIN)
+        # Still set coordinator state
         coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
-        coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
+        coordinator.bath_profile_current = None  # type: ignore[attr-defined]
+        coordinator.bath_profile_current_slot = None  # type: ignore[attr-defined]
+        return None
+    
+    # Create input_select helper using storage collection
+    name = f"{entry.title} Bath Profile"
+    entity_id = f"input_select.{slugify(name)}"  # Define entity_id before using it
+    
+    # Check if helper already exists
+    existing_state = hass.states.get(entity_id)
+    
+    # Try to access input_select storage collection
+    try:
+        # Access the input_select integration's storage collection
+        input_select_data = hass.data.get("input_select")
+        
+        if input_select_data:
+            # Look for storage collection with async_create_item method
+            storage_collection = None
+            for attr_name in ("async_create_item", "_storage_collection", "storage_collection"):
+                if hasattr(input_select_data, attr_name):
+                    attr = getattr(input_select_data, attr_name)
+                    if callable(attr):
+                        storage_collection = attr
+                        break
+                    elif hasattr(attr, "async_create_item"):
+                        storage_collection = attr.async_create_item
+                        break
+            
+            if storage_collection and callable(storage_collection):
+                if existing_state:
+                    # Helper exists - update options if they changed
+                    current_options = existing_state.attributes.get("options", [])
+                    if set(current_options) != set(options):
+                        # Options changed, update them
+                        await hass.services.async_call(
+                            "input_select",
+                            "set_options",
+                            {"entity_id": entity_id, "options": options},
+                            blocking=True,
+                        )
+                        LOGGER.info("%s - Updated input_select helper options: %s", DOMAIN, entity_id)
+                else:
+                    # Create helper via storage collection (matches YAML structure)
+                    item_id = slugify(name)
+                    item_data = {
+                        "id": item_id,
+                        "name": name,
+                        "options": options,
+                        "initial": options[0] if options else None,
+                        "icon": "mdi:bathtub",
+                    }
+                    await storage_collection(item_data)
+                    LOGGER.info("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
+            else:
+                raise AttributeError("Storage collection not found")
+        else:
+            raise KeyError("input_select not in hass.data")
+            
+    except (AttributeError, KeyError, Exception) as err:  # pylint: disable=broad-except
+        LOGGER.warning(
+            "%s - Cannot create input_select helper programmatically (%s). "
+            "Bath fill will work using coordinator state, but Bath Profile selection helper must be created manually. "
+            "Go to: Settings > Devices & Services > Helpers > Add Helper > Dropdown. "
+            "Name: '%s', Options: %s, Initial: %s, Icon: mdi:bathtub",
+            DOMAIN,
+            err,
+            name,
+            options,
+            options[0] if options else None,
+        )
+        # Set coordinator state even if helper creation failed
+        coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
+        coordinator.bath_profile_current = options[0] if options else None  # type: ignore[attr-defined]
+        current_slot = next((p.get("slot") for p in presets if p.get("label") == options[0] or p.get("name") == options[0]), None) if options and presets else None
         coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
         return None
-
-    # Track coordinator state
-    current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial else None
+    
+    # Initialize coordinator state
+    initial = options[0] if options else None
+    # Preserve existing selection if helper already exists
+    if existing_state and existing_state.state in options:
+        initial = existing_state.state
+    current_slot = next((p.get("slot") for p in presets if p.get("label") == initial or p.get("name") == initial), None) if initial and presets else None
     coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
     coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
     coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
-
-    # Listen for user selections to update coordinator state
+    
+    # Listen for state changes to update coordinator
     async def _handle_state_change(event):
         new_state = event.data.get("new_state")
         if not new_state:
@@ -272,13 +205,21 @@ async def _ensure_bath_profile_input_select(
         if option in options:
             coordinator.bath_profile_current = option  # type: ignore[attr-defined]
             coordinator.bath_profile_current_slot = next(  # type: ignore[attr-defined]
-                (p.get("slot") for p in presets if p.get("label") == option),
+                (p.get("slot") for p in presets if p.get("label") == option or p.get("name") == option),
                 None,
             )
-
+    
     unsub = async_track_state_change_event(hass, [entity_id], _handle_state_change)
     entry.async_on_unload(unsub)
-
+    
+    LOGGER.debug(
+        "%s input_select helper ready: %s options=%s initial=%s",
+        DOMAIN,
+        entity_id,
+        options,
+        initial,
+    )
+    
     return entity_id
 
 
@@ -305,12 +246,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Initialize coordinator bath profile state to safe defaults before helper setup
+    # Initialize coordinator bath profile state to safe defaults
     coordinator.bath_profile_options = []  # type: ignore[attr-defined]
     coordinator.bath_profile_current = None  # type: ignore[attr-defined]
     coordinator.bath_profile_current_slot = None  # type: ignore[attr-defined]
 
-    # Create/refresh bath profile input_select helper (replaces old select entity)
+    # Create/update bath profile input_select helper
     await _ensure_bath_profile_input_select(hass, entry, coordinator)
 
     # Register services once
@@ -333,19 +274,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
     coordinator: RheemEziSETDataUpdateCoordinator = hass.data[DOMAIN].get(entry.entry_id)
     platforms = coordinator.platforms if coordinator else PLATFORMS
-
-    # Best-effort cleanup of helper
-    try:
-        name = f"{entry.title} Bath Profile Input"
-        entity_id = f"input_select.{slugify(name)}"
-        await hass.services.async_call(
-            "input_select",
-            "remove",
-            {"entity_id": entity_id},
-            blocking=True,
-        )
-    except Exception:  # pylint: disable=broad-except
-        LOGGER.debug("%s - best-effort input_select removal failed", DOMAIN)
 
     # Cancel request worker task to prevent "Task was destroyed but it is pending" errors
     if coordinator and coordinator.api:

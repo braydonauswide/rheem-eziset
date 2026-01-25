@@ -117,7 +117,7 @@ homekit:
 
 Notes:
 - Do not rename entity_ids after pairing to HomeKit; it can create duplicate accessories.
-- The Bath Profile entity is now an `input_select` helper (HomeKit-friendly); its options mirror enabled bath fill presets.
+- The Bath Profile entity is an `input_select` entity (HomeKit-friendly); its options show labels with temperature and volume (e.g., "Children (Slot 1, 39C, 110L)").
 - If the device stops responding after rapid toggles, it may be in DoS lockout; wait for cooldown or power-cycle the heater/bridge.
 - UI alternative: in the HomeKit Bridge integration (UI), add only the Bath Profile selector, Bath Fill switch, and Exit Bath Fill to the include filter. Per-entity `entity_config` (e.g., `type: faucet`) may require YAML depending on HA version.
 - When starting Bath Fill, the integration aligns the heater’s target temperature to the Bath Fill temperature and may cancel any pending/optimistic temp change; after Bath Fill ends, the previous temp is restored when the heater is idle.

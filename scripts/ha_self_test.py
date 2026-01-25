@@ -356,14 +356,23 @@ def _resolve_entity_ids(entry_id: str, registry_entries: list[dict[str, Any]]) -
     def optional(uid: str) -> str | None:
         return by_unique.get(uid)
 
-    # Try to find bath profile select (old) or input_select helper (new)
-    bath_profile = optional(f"{entry_id}-bath_profile")
+    # Try to find bath profile input_select entity (registered under input_select domain)
+    bath_profile = optional(f"{entry_id}-bath_profile_input_select")
     if not bath_profile:
-        # Look for input_select entities that might be the bath profile helper
+        # Fallback: try old select entity
+        bath_profile = optional(f"{entry_id}-bath_profile")
+    if not bath_profile:
+        # Look for input_select entities first (preferred)
         for eid, e in by_entity_id.items():
             if eid.startswith("input_select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
                 bath_profile = eid
                 break
+        # Fallback: look for select entities
+        if not bath_profile:
+            for eid, e in by_entity_id.items():
+                if eid.startswith("select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
+                    bath_profile = eid
+                    break
 
     return EntityIds(
         water_heater=need(f"{entry_id}-water-heater"),
