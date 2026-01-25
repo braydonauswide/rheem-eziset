@@ -67,7 +67,13 @@ async def _ensure_bath_profile_input_select(
     """Create/update input_select for bath profiles and wire coordinator state."""
     # Ensure the input_select domain is loaded before calling helper services.
     if not hass.services.has_service("input_select", "create"):
-        await async_setup_component(hass, "input_select", {})
+        result = await async_setup_component(hass, "input_select", {})
+        if not result:
+            LOGGER.warning("%s - Failed to load input_select helper domain", DOMAIN)
+        # Verify service is now available
+        if not hass.services.has_service("input_select", "create"):
+            LOGGER.error("%s - input_select.create service not available after setup", DOMAIN)
+            return None
 
     presets = _build_presets(entry)
     options = [p["label"] for p in presets]
@@ -88,33 +94,37 @@ async def _ensure_bath_profile_input_select(
     if initial is None and options:
         initial = options[0]
 
-    if existing_state:
-        await hass.services.async_call(
-            "input_select",
-            "set_options",
-            {"entity_id": entity_id, "options": displayed_options},
-            blocking=True,
-        )
-        # Re-apply last selection if still valid, otherwise fall back to first option.
-        if initial or displayed_options:
+    try:
+        if existing_state:
             await hass.services.async_call(
                 "input_select",
-                "select_option",
-                {"entity_id": entity_id, "option": initial or displayed_options[0]},
+                "set_options",
+                {"entity_id": entity_id, "options": displayed_options},
                 blocking=True,
             )
-    else:
-        await hass.services.async_call(
-            "input_select",
-            "create",
-            {
-                "name": name,
-                "options": displayed_options,
-                "initial": initial or (displayed_options[0] if displayed_options else None),
-                "icon": "mdi:bathtub",
-            },
-            blocking=True,
-        )
+            # Re-apply last selection if still valid, otherwise fall back to first option.
+            if initial or displayed_options:
+                await hass.services.async_call(
+                    "input_select",
+                    "select_option",
+                    {"entity_id": entity_id, "option": initial or displayed_options[0]},
+                    blocking=True,
+                )
+        else:
+            await hass.services.async_call(
+                "input_select",
+                "create",
+                {
+                    "name": name,
+                    "options": displayed_options,
+                    "initial": initial or (displayed_options[0] if displayed_options else None),
+                    "icon": "mdi:bathtub",
+                },
+                blocking=True,
+            )
+    except Exception as err:  # pylint: disable=broad-except
+        LOGGER.error("%s - Failed to create/update input_select helper: %s", DOMAIN, err, exc_info=True)
+        return None
 
     # Track coordinator state
     current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial else None
