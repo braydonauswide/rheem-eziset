@@ -65,6 +65,20 @@ def _build_presets(entry: ConfigEntry) -> list[dict]:
             continue
         label = _format_label(str(name), idx, int(temp), int(vol))
         presets.append({"name": str(name), "temp": int(temp), "vol": int(vol), "slot": idx, "label": label})
+    if not presets and use_defaults and DEFAULT_BATHFILL_PRESETS:
+        # Fallback: synthesize defaults to keep bath fill usable
+        for idx, defaults in DEFAULT_BATHFILL_PRESETS.items():
+            label = _format_label(str(defaults.get("name", f"Preset {idx}")), idx, defaults.get("temp"), defaults.get("vol"))
+            presets.append(
+                {
+                    "name": str(defaults.get("name", f"Preset {idx}")),
+                    "temp": int(defaults.get("temp", 0) or 0),
+                    "vol": int(defaults.get("vol", 0) or 0),
+                    "slot": idx,
+                    "label": label,
+                }
+            )
+        LOGGER.warning("%s - No presets enabled; synthesized defaults for bath fill", DOMAIN)
     if not presets:
         LOGGER.warning(
             "%s - No enabled bath presets after build; use_defaults=%s options_present=%s",
