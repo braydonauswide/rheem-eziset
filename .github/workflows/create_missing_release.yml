@@ -1,4 +1,4 @@
-name: "Create Missing Release for 2026.1.4"
+name: "Create Missing Releases"
 
 on:
   workflow_dispatch:
@@ -7,33 +7,27 @@ permissions:
   contents: write
 
 jobs:
-  create-release:
-    name: "Create Release for 2026.1.4"
+  create-releases:
+    name: "Create Releases for Missing Tags"
     runs-on: "ubuntu-latest"
     steps:
       - name: "Checkout the repository"
         uses: "actions/checkout@v4.1.7"
 
-      - name: "Check if release exists"
-        id: "check"
+      - name: "Check and create release for 1.0.0"
         shell: "bash"
         run: |
           RELEASE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/2026.1.4")
-          if [ "$RELEASE_RESPONSE" = "200" ]; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/1.0.0")
+          if [ "$RELEASE_RESPONSE" != "200" ]; then
+            gh release create "1.0.0" \
+              --title "1.0.0" \
+              --generate-notes \
+              --repo "${{ github.repository }}"
           else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Release for 1.0.0 already exists"
           fi
-
-      - name: "Create GitHub Release for 2026.1.4"
-        if: steps.check.outputs.exists == 'false'
-        uses: "softprops/action-gh-release@v2.0.6"
-        with:
-          tag_name: "2026.1.4"
-          name: "2026.1.4"
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
