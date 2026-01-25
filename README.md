@@ -13,7 +13,7 @@ This repository is a **community fork** and is **not maintained by the original 
 
 ## Important
 
-- Targets **Home Assistant ≥ 2026.1.4** (domain remains `rheem_eziset`; display name is **Rheem EziSET HomeKit**).
+- Targets **Home Assistant ≥ 2026.1.1** (domain remains `rheem_eziset`; display name is **Rheem EziSET HomeKit**).
 - Device has **DoS protection**: never exceed ~1 request/sec to the heater (polling + control combined). If the device stops responding, wait for cooldown; power-cycle if needed.
 
 ## Notice

@@ -24,7 +24,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "Compute versions (SemVer patch bump)"
+      - name: "Read manifest version"
         id: "versions"
         shell: "bash"
         run: |
@@ -38,11 +38,8 @@ jobs:
           parts = current.split(".")
           if len(parts) != 3 or not all(p.isdigit() for p in parts):
               raise SystemExit(f"Invalid manifest.json version: {current!r}")
-          major, minor, patch = map(int, parts)
-          next_version = f"{major}.{minor}.{patch + 1}"
 
           print(f"current={current}")
-          print(f"next={next_version}")
           PY
 
       - name: "Fetch tags"
@@ -50,46 +47,11 @@ jobs:
         run: |
           git fetch --tags --force
 
-      - name: "Check for existing current tag"
-        id: "current_tag"
-        shell: "bash"
-        run: |
-          if git rev-parse "refs/tags/${{ steps.versions.outputs.current }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: "Check for existing GitHub release (current)"
-        id: "current_release"
-        if: steps.current_tag.outputs.exists == 'true'
-        shell: "bash"
-        run: |
-          RELEASE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.versions.outputs.current }}")
-          if [ "$RELEASE_RESPONSE" = "200" ]; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: "Create GitHub Release (current)"
-        if: steps.current_tag.outputs.exists == 'true' && steps.current_release.outputs.exists == 'false'
-        uses: "softprops/action-gh-release@v2.0.6"
-        with:
-          tag_name: "${{ steps.versions.outputs.current }}"
-          name: "${{ steps.versions.outputs.current }}"
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-
-      - name: "Check for existing next tag"
+      - name: "Check for existing tag"
         id: "tag"
         shell: "bash"
         run: |
-          if git rev-parse "refs/tags/${{ steps.versions.outputs.next }}" >/dev/null 2>&1; then
+          if git rev-parse "refs/tags/${{ steps.versions.outputs.current }}" >/dev/null 2>&1; then
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           else
             echo "exists=false" >> "${GITHUB_OUTPUT}"
@@ -99,7 +61,7 @@ jobs:
         if: steps.tag.outputs.exists == 'false'
         shell: "bash"
         run: |
-          python3 scripts/update_version.py "${{ steps.versions.outputs.next }}"
+          python3 scripts/update_version.py "${{ steps.versions.outputs.current }}"
 
       - name: "Commit version updates"
         if: steps.tag.outputs.exists == 'false'
@@ -111,7 +73,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No version changes to commit"
           else
-            git commit -m "Bump version to ${{ steps.versions.outputs.next }}"
+            git commit -m "Bump version to ${{ steps.versions.outputs.current }}"
           fi
 
       - name: "Push version commit"
@@ -124,8 +86,8 @@ jobs:
         if: steps.tag.outputs.exists == 'false'
         shell: "bash"
         run: |
-          git tag "${{ steps.versions.outputs.next }}"
-          git push origin "${{ steps.versions.outputs.next }}"
+          git tag "${{ steps.versions.outputs.current }}"
+          git push origin "${{ steps.versions.outputs.current }}"
 
       - name: "Check for existing GitHub release"
         id: "release"
@@ -134,7 +96,7 @@ jobs:
           RELEASE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.versions.outputs.next }}")
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.versions.outputs.current }}")
           if [ "$RELEASE_RESPONSE" = "200" ]; then
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           else
@@ -145,8 +107,8 @@ jobs:
         if: steps.release.outputs.exists == 'false'
         uses: "softprops/action-gh-release@v2.0.6"
         with:
-          tag_name: "${{ steps.versions.outputs.next }}"
-          name: "${{ steps.versions.outputs.next }}"
+          tag_name: "${{ steps.versions.outputs.current }}"
+          name: "${{ steps.versions.outputs.current }}"
           generate_release_notes: true
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

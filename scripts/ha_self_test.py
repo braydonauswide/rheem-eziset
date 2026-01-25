@@ -686,6 +686,29 @@ async def _wait_for_mode(
     )
 
 
+async def _set_temp_and_wait(
+    rest: HaRestClient,
+    ids: EntityIds,
+    temp: int,
+    timeout_s: float = 12.0,
+    poll_s: float = 1.0,
+) -> float:
+    """Set target temperature and wait for HA state to reflect it; returns latency in seconds."""
+    start = time.monotonic()
+    await rest.call_service("water_heater", "set_temperature", {"entity_id": ids.water_heater, "temperature": temp})
+    # Give the device a moment to process before first poll
+    await asyncio.sleep(poll_s)
+    while True:
+        state = await rest.get_state(ids.water_heater)
+        attrs = state.get("attributes") or {}
+        current = _try_int(attrs.get("temperature"))
+        if current == temp:
+            return time.monotonic() - start
+        if time.monotonic() - start > timeout_s:
+            raise RuntimeError(f"Timed out waiting for temperature {temp}")
+        await asyncio.sleep(poll_s)
+
+
 def _arg_or_env(value: str | None, env_key: str) -> str | None:
     return value if value else os.environ.get(env_key)
 
@@ -715,6 +738,7 @@ async def async_main() -> int:
             "lockout_recovery",
             "performance",
             "flow_exit_behavior",
+            "rate_limit_iterative",
         ],
         default="core",
     )
@@ -1464,6 +1488,61 @@ async def async_main() -> int:
 
             await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
             print("rate_limit_compliance suite complete")
+
+        if args.suite == "rate_limit_iterative":
+            # --- Rate Limit Iterative Step-Down ---
+            print("=== Rate Limit Iterative (0.1s step-down) ===")
+            print("Goal: confirm <3s temp update latency while stepping interval down until failure (respecting MIN_REQUEST_GAP).")
+            await _wait_for_idle_controls(rest, ids, timeout_s=600, poll_s=5.0)
+
+            wh = await rest.get_state(ids.water_heater)
+            wh_attrs = wh.get("attributes") or {}
+            original_temp = _try_int(wh_attrs.get("temperature")) or 45
+            temp_high = min(original_temp + 1, 50)
+            temp_low = max(temp_high - 2, 40)
+            interval = 2.0
+            min_interval = 1.1  # stay above documented safe range
+            step = 0.1
+            best_interval = None
+            best_latency = None
+            toggle = True
+
+            while interval >= min_interval:
+                target_temp = temp_high if toggle else temp_low
+                print(f"--- Interval {interval:.1f}s -> target {target_temp}C ---")
+                try:
+                    latency = await _set_temp_and_wait(rest, ids, target_temp, timeout_s=12.0, poll_s=1.0)
+                    print(f"  ✓ Updated in {latency:.2f}s at interval {interval:.1f}s")
+                    if latency <= 3.0:
+                        best_interval = interval
+                        best_latency = latency
+                        interval = round(interval - step, 2)
+                        toggle = not toggle
+                        # Honor MIN_REQUEST_GAP safety margin before next attempt
+                        await asyncio.sleep(max(interval, 1.6))
+                    else:
+                        print(f"  STOP: Latency {latency:.2f}s exceeded 3s target")
+                        break
+                except Exception as err:
+                    print(f"  STOP: Failed at interval {interval:.1f}s: {err}")
+                    break
+
+            # Restore original temp best-effort
+            try:
+                await rest.call_service("water_heater", "set_temperature", {"entity_id": ids.water_heater, "temperature": original_temp})
+                await asyncio.sleep(2.0)
+            except Exception as err:
+                print(f"  WARNING: could not restore original temp {original_temp}: {err}")
+
+            if best_interval is None:
+                print("rate_limit_iterative complete: no passing interval found before failure")
+                return 1
+
+            print("rate_limit_iterative complete:")
+            print(f"  Best passing interval: {best_interval:.2f}s")
+            if best_latency is not None:
+                print(f"  Best observed latency: {best_latency:.2f}s")
+            return 0
 
         if args.suite == "lockout_recovery":
             # --- Lockout Recovery Suite ---
