@@ -113,6 +113,7 @@ class RheemEziSETApi:
         self._owned_sid: int | None = None
         self._prev_temp_for_bathfill: int | None = None
         self._pending_restore_temp: int | None = None
+        self._bathfill_target_temp: int | None = None
         self._cancel_user_settemp: bool = False
         # Default to a longer session timer so bath fill doesn't expire while waiting for user actions.
         self._control_session_timer: int = 600
@@ -182,6 +183,20 @@ class RheemEziSETApi:
         except Exception:
             return {"entity_id": entity_id, "state": None}
         return {"entity_id": entity_id, "state": None}
+
+    def _with_transient_fields(self, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Attach transient integration fields (e.g., bath fill target temp)."""
+        data = dict(payload or {})
+        target_temp = self._bathfill_target_temp
+        if target_temp is not None:
+            if self._bathfill_engaged(data):
+                data["bathfill_target_temp"] = target_temp
+            else:
+                self._bathfill_target_temp = None
+                data.pop("bathfill_target_temp", None)
+        else:
+            data.pop("bathfill_target_temp", None)
+        return data
 
     def _log_action(self, action: str, stage: str, *, control_seq_id: str | None = None, extra: dict[str, Any] | None = None) -> None:
         """Emit an action log with snapshot + extras."""
@@ -842,7 +857,7 @@ class RheemEziSETApi:
             merged: dict[str, Any] = {}
             for src in (self._last_version or {}, self._last_params or {}, self._last_info):
                 merged.update(src)
-            return merged
+            return self._with_transient_fields(merged)
 
         merged: dict[str, Any] = {}
 
@@ -873,7 +888,7 @@ class RheemEziSETApi:
                 # Only enter lockout if critical endpoint (info) fails repeatedly
                 if self._endpoint_failure_count["info"] >= self.LOCKOUT_CONSEC_FAILURES:
                     await self._record_failure()
-                return self._last_info
+                return self._with_transient_fields(self._last_info)
             raise HomeAssistantError(
                 f"{DOMAIN} - Device returned invalid data. "
                 f"This may indicate a communication problem. "
@@ -1000,7 +1015,7 @@ class RheemEziSETApi:
             fill_percent = 0.0
 
         self._schedule_drain()
-        return merged
+        return self._with_transient_fields(merged)
 
     async def async_get_info_only(self) -> dict[str, Any]:
         """Fetch only getInfo (sid-aware) and merge with cached params/version without refetching them."""
@@ -1014,7 +1029,7 @@ class RheemEziSETApi:
             merged: dict[str, Any] = {}
             for src in (self._last_version or {}, self._last_params or {}, self._last_info):
                 merged.update(src)
-            return merged
+            return self._with_transient_fields(merged)
 
         merged: dict[str, Any] = {}
         info: dict[str, Any] | None = None
@@ -1030,7 +1045,7 @@ class RheemEziSETApi:
 
         for src in (self._last_version or {}, self._last_params or {}, info or {}):
             merged.update(src)
-        return merged
+        return self._with_transient_fields(merged)
 
     # ---------------------------------------------------------
     # Control helpers
@@ -1407,6 +1422,7 @@ class RheemEziSETApi:
             except Exception:
                 self._owned_sid = None
             self._last_info = resp
+            self._bathfill_target_temp = temp
             self._log_action(
                 "bathfill_set_temp",
                 "ok",
@@ -1714,6 +1730,7 @@ class RheemEziSETApi:
                     self._owned_sid = None
                 # Capture immediate response and, if possible, a follow-up getInfo to include fillPercent.
                 self._last_info = resp
+                self._bathfill_target_temp = temp
             self._log_action(
                 "bathfill_start",
                 "ok",
@@ -1837,6 +1854,7 @@ class RheemEziSETApi:
             self._bathfill_latched = False
             self._completion_latched = False
             self._ignore_completion_state = True
+            self._bathfill_target_temp = None
 
             if self._pending_restore_temp is not None:
                 mode_val = to_int(safe_info.get("mode"))

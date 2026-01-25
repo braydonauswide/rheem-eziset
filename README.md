@@ -84,7 +84,7 @@ Notes on versions in HACS:
 ### HomeKit Bridge exposure (Apple Home/Siri)
 
 Recommend a dedicated HomeKit Bridge instance filtered to only the Bath Fill entities to avoid clutter and stay under the 150 accessory limit:
-- Bath Profile selector (set `type: faucet`)
+- Bath Profile input_select (set `type: faucet`)
 - Bath Fill switch (set `type: faucet`)
 - Exit Bath Fill switch
 - Bath Fill Status sensor
@@ -98,13 +98,13 @@ homekit:
     mode: bridge
     filter:
       include_entities:
-        - select.<your_entity_id_for_bath_profile>
+        - input_select.<your_entity_id_for_bath_profile>
         - switch.<your_entity_id_for_bath_fill>
         - switch.<your_entity_id_for_exit_bath_fill>
         - sensor.<your_entity_id_for_bath_fill_status>
         - sensor.<your_entity_id_for_bath_fill_progress>
     entity_config:
-      select.<your_entity_id_for_bath_profile>:
+      input_select.<your_entity_id_for_bath_profile>:
         type: faucet
       switch.<your_entity_id_for_bath_fill>:
         type: faucet
@@ -117,6 +117,7 @@ homekit:
 
 Notes:
 - Do not rename entity_ids after pairing to HomeKit; it can create duplicate accessories.
+- The Bath Profile entity is now an `input_select` helper (HomeKit-friendly); its options mirror enabled bath fill presets.
 - If the device stops responding after rapid toggles, it may be in DoS lockout; wait for cooldown or power-cycle the heater/bridge.
 - UI alternative: in the HomeKit Bridge integration (UI), add only the Bath Profile selector, Bath Fill switch, and Exit Bath Fill to the include filter. Per-entity `entity_config` (e.g., `type: faucet`) may require YAML depending on HA version.
 - When starting Bath Fill, the integration aligns the heater’s target temperature to the Bath Fill temperature and may cancel any pending/optimistic temp change; after Bath Fill ends, the previous temp is restored when the heater is idle.
@@ -142,6 +143,7 @@ Steps:
 2. Turn **ON** the **Bath Fill** switch.
 3. Open the bath hot tap.
 4. When filling completes (mode 35), **close the tap**, then **turn the Bath Fill switch OFF** (or use Exit Bath Fill).
+5. After starting, the `water_heater` entity exposes `bathfill_target_temperature` so you can confirm the requested bath fill setpoint.
 
 ### Cancel / Exit
 - Turn **OFF** the **Bath Fill** switch, or use **Exit Bath Fill** (momentary switch).

@@ -37,6 +37,13 @@ def _build_presets(entry: ConfigEntry) -> list[dict]:
     opts = entry.options
     use_defaults = not any(key.startswith("bathfill_preset_") for key in opts)
 
+    def _format_label(name: str, slot: int, temp: int | None, vol: int | None) -> str:
+        """Format a stable, user-friendly label for an enabled preset."""
+        safe_name = name.strip() or f"Preset {slot}"
+        temp_part = f"{temp}C" if temp is not None else "temp?"
+        vol_part = f"{vol}L" if vol is not None else "vol?"
+        return f"{safe_name} (Slot {slot}, {temp_part}, {vol_part})"
+
     for idx in range(1, PRESET_SLOTS + 1):
         defaults = DEFAULT_BATHFILL_PRESETS.get(idx) if use_defaults else None
         enabled_raw = opts.get(f"bathfill_preset_{idx}_enabled")
@@ -48,7 +55,8 @@ def _build_presets(entry: ConfigEntry) -> list[dict]:
         vol = to_int(opts.get(f"bathfill_preset_{idx}_vol")) or (defaults.get("vol") if defaults else None)
         if temp is None or vol is None:
             continue
-        presets.append({"name": str(name), "temp": int(temp), "vol": int(vol), "slot": idx})
+        label = _format_label(str(name), idx, int(temp), int(vol))
+        presets.append({"name": str(name), "temp": int(temp), "vol": int(vol), "slot": idx, "label": label})
     return presets
 
 
@@ -57,39 +65,57 @@ async def _ensure_bath_profile_input_select(
 ) -> str | None:
     """Create/update input_select for bath profiles and wire coordinator state."""
     presets = _build_presets(entry)
-    options = [p["name"] for p in presets] or ["No presets configured"]
-    initial = options[0] if options else None
+    options = [p["label"] for p in presets]
+    placeholder = "No presets configured"
+    displayed_options = options or [placeholder]
 
     name = f"{entry.title} Bath Profile Input"
     entity_id = f"input_select.{slugify(name)}"
+    existing_state = hass.states.get(entity_id)
 
-    # Remove any prior helper to keep options in sync
-    try:
+    # Preserve the user's last choice when possible.
+    prior_option = getattr(coordinator, "bath_profile_current", None)
+    initial = None
+    for candidate in (existing_state.state if existing_state else None, prior_option):
+        if candidate in options:
+            initial = candidate
+            break
+    if initial is None and options:
+        initial = options[0]
+
+    if existing_state:
         await hass.services.async_call(
             "input_select",
-            "remove",
-            {"entity_id": entity_id},
+            "set_options",
+            {"entity_id": entity_id, "options": displayed_options},
             blocking=True,
         )
-    except Exception:  # pylint: disable=broad-except
-        # Helper may not exist yet; ignore.
-        pass
-
-    await hass.services.async_call(
-        "input_select",
-        "create",
-        {
-            "name": name,
-            "options": options,
-            "initial": initial,
-            "icon": "mdi:bathtub",
-        },
-        blocking=True,
-    )
+        # Re-apply last selection if still valid, otherwise fall back to first option.
+        if initial or displayed_options:
+            await hass.services.async_call(
+                "input_select",
+                "select_option",
+                {"entity_id": entity_id, "option": initial or displayed_options[0]},
+                blocking=True,
+            )
+    else:
+        await hass.services.async_call(
+            "input_select",
+            "create",
+            {
+                "name": name,
+                "options": displayed_options,
+                "initial": initial or (displayed_options[0] if displayed_options else None),
+                "icon": "mdi:bathtub",
+            },
+            blocking=True,
+        )
 
     # Track coordinator state
+    current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial else None
     coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
     coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
+    coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
 
     # Listen for user selections to update coordinator state
     async def _handle_state_change(event):
@@ -99,6 +125,10 @@ async def _ensure_bath_profile_input_select(
         option = new_state.state
         if option in options:
             coordinator.bath_profile_current = option  # type: ignore[attr-defined]
+            coordinator.bath_profile_current_slot = next(  # type: ignore[attr-defined]
+                (p.get("slot") for p in presets if p.get("label") == option),
+                None,
+            )
 
     unsub = async_track_state_change_event(hass, [entity_id], _handle_state_change)
     entry.async_on_unload(unsub)

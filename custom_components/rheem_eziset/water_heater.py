@@ -84,6 +84,10 @@ class RheemEziSETWaterHeater(RheemEziSETEntity, WaterHeaterEntity):
         data["session_owner"] = "integration" if owned_sid else "none"
         if owned_sid:
             data["session_id"] = owned_sid
+
+        bathfill_target = to_int((self.coordinator.data or {}).get("bathfill_target_temp"))
+        if bathfill_target is not None:
+            data["bathfill_target_temperature"] = bathfill_target
         
         return data
 
@@ -133,6 +137,9 @@ class RheemEziSETWaterHeater(RheemEziSETEntity, WaterHeaterEntity):
     @property
     def target_temperature(self):
         """Return the target temperature or the current temperature if there is no target."""
+        bathfill_target = to_int((self.coordinator.data or {}).get("bathfill_target_temp"))
+        if bathfill_target is not None:
+            return bathfill_target
         if self.rheem_target_temperature is not None:
             return self.rheem_target_temperature
         current = self.current_temperature

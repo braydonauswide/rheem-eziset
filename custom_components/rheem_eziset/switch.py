@@ -41,11 +41,12 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
         """Return (temp, vol) for current profile selection."""
         presets = getattr(self.coordinator, "bath_profile_options", []) or []
         current_name = getattr(self.coordinator, "bath_profile_current", None)
+        current_slot = getattr(self.coordinator, "bath_profile_current_slot", None)
         chosen = None
-        for p in presets:
-            if p.get("name") == current_name:
-                chosen = p
-                break
+        if current_slot is not None:
+            chosen = next((p for p in presets if p.get("slot") == current_slot), None)
+        if chosen is None and current_name:
+            chosen = next((p for p in presets if p.get("label") == current_name or p.get("name") == current_name), None)
         if chosen is None and presets:
             chosen = presets[0]
         if not chosen:
@@ -61,7 +62,7 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
         """Start bath fill using selected profile."""
         temp, vol = self._current_profile()
         if temp is None or vol is None:
-            raise HomeAssistantError("No valid bath profile selected.")
+            raise HomeAssistantError("No valid bath profile selected. Configure bath fill presets in Options.")
         await self.coordinator.api.async_start_bath_fill(temp, vol, origin="user", entity_id=self.entity_id)
         self._attr_is_on = True
         self._desired_on = True
