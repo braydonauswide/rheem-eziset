@@ -36,6 +36,8 @@ scripts/develop
 scripts/setup
 scripts/lint
 scripts/update_version.py
+scripts/test_rate_limit.py
+test_rate_limit_results.json
 requirements-dev.txt
 requirements.txt
 requirements-ha.txt

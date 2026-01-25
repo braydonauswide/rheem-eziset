@@ -77,11 +77,20 @@ class RheemEziSETApi:
     LOCKOUT_CONSEC_FAILURES = 3
     COOLDOWN_SCHEDULE_S = [10, 30, 60, 180]
 
-    def __init__(self, hass, host: str) -> None:
-        """Initialise the basic parameters."""
+    def __init__(self, hass, host: str, *, test_min_request_gap: float | None = None) -> None:
+        """Initialise the basic parameters.
+        
+        Args:
+            hass: Home Assistant instance
+            host: Device hostname/IP
+            test_min_request_gap: Optional override for MIN_REQUEST_GAP (testing only)
+        """
         self.hass = hass
         self.host = host
         self.base_url = f"http://{host}/"
+        
+        # Allow test mode to override MIN_REQUEST_GAP
+        self._effective_min_request_gap = test_min_request_gap if test_min_request_gap is not None else self.MIN_REQUEST_GAP
 
         self._request_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
@@ -575,7 +584,7 @@ class RheemEziSETApi:
             wait_actual_ms = int((time.monotonic() - wait_start) * 1000)
             # reserve slot by start time
             next_request_at_before = self._next_request_at
-            self._next_request_at = time.monotonic() + self.MIN_REQUEST_GAP
+            self._next_request_at = time.monotonic() + self._effective_min_request_gap
 
             session = async_get_clientsession(self.hass)
             url = f"{self.base_url}{path}"
@@ -1126,7 +1135,7 @@ class RheemEziSETApi:
                         is_timeout = isinstance(err.__cause__, asyncio.TimeoutError) or "TimeoutError" in str(err.__cause__ or err)
                         if is_timeout and attempt < attempts - 1:
                             self._apply_control_cooldown("ctrl_timeout", base=12.0)
-                            await asyncio.sleep(self.MIN_REQUEST_GAP + 0.5)
+                            await asyncio.sleep(self._effective_min_request_gap + 0.5)
                             continue
                         raise
                 if last_err:
@@ -1666,7 +1675,7 @@ class RheemEziSETApi:
                     data = refreshed
                 if to_int((data or {}).get("sTimeout")) in (0, None):
                     break
-                await asyncio.sleep(self.MIN_REQUEST_GAP)
+                await asyncio.sleep(self._effective_min_request_gap)
         current_sid = to_int(data.get("sid"))
         if self._owned_sid and not self._bathfill_active(data) and current_sid in (0, None):
             self._owned_sid = None
