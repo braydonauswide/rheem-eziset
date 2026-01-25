@@ -14,6 +14,7 @@ from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.setup import async_setup_component
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import slugify
 
@@ -64,6 +65,10 @@ async def _ensure_bath_profile_input_select(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: RheemEziSETDataUpdateCoordinator
 ) -> str | None:
     """Create/update input_select for bath profiles and wire coordinator state."""
+    # Ensure the input_select domain is loaded before calling helper services.
+    if not hass.services.has_service("input_select", "create"):
+        await async_setup_component(hass, "input_select", {})
+
     presets = _build_presets(entry)
     options = [p["label"] for p in presets]
     placeholder = "No presets configured"
