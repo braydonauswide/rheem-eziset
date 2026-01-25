@@ -1,5 +1,5 @@
 {
   "name": "Rheem EziSET HomeKit",
-  "homeassistant": "2026.1.0",
+  "homeassistant": "2026.1.4",
   "render_readme": true
 }

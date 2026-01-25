@@ -60,18 +60,18 @@ jobs:
             git commit -m "Bump version to ${{ steps.version.outputs.version }}"
           fi
 
+      - name: "Push version commit"
+        if: steps.tag.outputs.exists == 'false'
+        shell: "bash"
+        run: |
+          git push origin main
+
       - name: "Create and push tag"
         if: steps.tag.outputs.exists == 'false'
         shell: "bash"
         run: |
           git tag "${{ steps.version.outputs.version }}"
           git push origin "${{ steps.version.outputs.version }}"
-
-      - name: "Push version commit"
-        if: steps.tag.outputs.exists == 'false'
-        shell: "bash"
-        run: |
-          git push origin main
 
       - name: "Create GitHub Release"
         if: steps.tag.outputs.exists == 'false'
