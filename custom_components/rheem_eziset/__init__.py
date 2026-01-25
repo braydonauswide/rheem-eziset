@@ -17,6 +17,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import slugify
+from homeassistant.components import input_select
 
 from .api import RheemEziSETApi
 from .const import (
@@ -95,15 +96,10 @@ async def _ensure_bath_profile_input_select(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: RheemEziSETDataUpdateCoordinator
 ) -> str | None:
     """Create/update input_select for bath profiles and wire coordinator state."""
-    # Ensure the input_select domain is loaded before calling helper services.
-    if not hass.services.has_service("input_select", "create"):
-        result = await async_setup_component(hass, "input_select", {})
-        if not result:
-            LOGGER.warning("%s - Failed to load input_select helper domain", DOMAIN)
-        # Verify service is now available
-        if not hass.services.has_service("input_select", "create"):
-            LOGGER.error("%s - input_select.create service not available after setup", DOMAIN)
-            return None
+    # Ensure the input_select domain is loaded
+    result = await async_setup_component(hass, "input_select", {})
+    if not result:
+        LOGGER.warning("%s - Failed to load input_select helper domain", DOMAIN)
 
     presets = _build_presets(entry)
     options = [p["label"] for p in presets]
@@ -126,6 +122,7 @@ async def _ensure_bath_profile_input_select(
 
     try:
         if existing_state:
+            # Entity exists, just update options
             await hass.services.async_call(
                 "input_select",
                 "set_options",
@@ -141,17 +138,85 @@ async def _ensure_bath_profile_input_select(
                     blocking=True,
                 )
         else:
-            await hass.services.async_call(
-                "input_select",
-                "create",
-                {
-                    "name": name,
-                    "options": displayed_options,
-                    "initial": initial or (displayed_options[0] if displayed_options else None),
-                    "icon": "mdi:bathtub",
-                },
-                blocking=True,
-            )
+            # Entity doesn't exist - create via storage collection API
+            # In HA 2026.1+, input_select uses storage collections
+            # Try to access the storage collection through the integration's data
+            try:
+                # Access input_select integration storage collection
+                # The collection is typically accessible via hass.data after component setup
+                input_select_data = hass.data.get("input_select")
+                
+                # Check multiple possible locations for the storage collection
+                storage_collection = None
+                if input_select_data:
+                    # Try different attribute names that storage collections might use
+                    for attr in ("async_create_item", "create_item", "_storage_collection", "storage_collection"):
+                        if hasattr(input_select_data, attr):
+                            storage_collection = getattr(input_select_data, attr)
+                            if callable(storage_collection):
+                                break
+                            elif hasattr(storage_collection, "async_create_item"):
+                                storage_collection = storage_collection.async_create_item
+                                break
+                
+                if storage_collection and callable(storage_collection):
+                    # Create item via storage collection
+                    item_id = slugify(name)
+                    await storage_collection(
+                        {
+                            "id": item_id,
+                            "name": name,
+                            "options": displayed_options,
+                            "initial": initial or (displayed_options[0] if displayed_options else None),
+                            "icon": "mdi:bathtub",
+                        }
+                    )
+                    LOGGER.debug("%s - Created input_select helper via storage collection: %s", DOMAIN, entity_id)
+                else:
+                    # Storage collection not accessible - use REST API as fallback
+                    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+                    from aiohttp import ClientTimeout
+                    
+                    # Try helper creation via REST API
+                    internal_url = str(hass.config.internal_url) if hass.config.internal_url else "http://127.0.0.1:8123"
+                    url = f"{internal_url}/api/config/config_entries/helper/create"
+                    
+                    payload = {
+                        "type": "input_select",
+                        "name": name,
+                        "options": displayed_options,
+                        "initial": initial or (displayed_options[0] if displayed_options else None),
+                        "icon": "mdi:bathtub",
+                    }
+                    
+                    session = async_get_clientsession(hass)
+                    async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            LOGGER.debug("%s - Created input_select helper via REST API: %s", DOMAIN, entity_id)
+                        else:
+                            error_text = await resp.text()
+                            raise HomeAssistantError(f"Failed to create helper via REST API: HTTP {resp.status} - {error_text}")
+            except (AttributeError, KeyError, ImportError, Exception, HomeAssistantError) as err:  # pylint: disable=broad-except
+                # All creation methods failed - log clear instructions and continue without helper
+                LOGGER.warning(
+                    "%s - Cannot create input_select helper programmatically (%s). "
+                    "Bath fill will work using coordinator state, but Bath Profile selection helper must be created manually. "
+                    "Go to: Settings > Devices & Services > Helpers > Add Helper > Dropdown. "
+                    "Name: '%s', Options: %s, Initial: %s, Icon: mdi:bathtub",
+                    DOMAIN,
+                    err,
+                    name,
+                    displayed_options,
+                    initial or displayed_options[0] if displayed_options else None,
+                )
+                # Don't raise - allow integration to continue without helper
+                # Coordinator state will be set below, so bath fill will work
+                # Set coordinator state even though helper creation failed
+                current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial and presets else None
+                coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
+                coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
+                coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
+                return None
         LOGGER.debug(
             "%s input_select helper ready entity_id=%s options=%s initial=%s existing=%s",
             DOMAIN,
