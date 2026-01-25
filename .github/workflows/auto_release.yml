@@ -73,8 +73,22 @@ jobs:
           git tag "${{ steps.version.outputs.version }}"
           git push origin "${{ steps.version.outputs.version }}"
 
+      - name: "Check for existing GitHub release"
+        id: "release"
+        shell: "bash"
+        run: |
+          RELEASE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.version }}")
+          if [ "$RELEASE_RESPONSE" = "200" ]; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: "Create GitHub Release"
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.release.outputs.exists == 'false'
         uses: "softprops/action-gh-release@v2.0.6"
         with:
           tag_name: "${{ steps.version.outputs.version }}"
