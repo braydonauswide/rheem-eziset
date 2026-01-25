@@ -39,19 +39,26 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
 
     def _current_profile(self) -> tuple[int | None, int | None]:
         """Return (temp, vol) for current profile selection."""
-        presets = getattr(self.coordinator, "bath_profile_options", []) or []
-        current_name = getattr(self.coordinator, "bath_profile_current", None)
-        current_slot = getattr(self.coordinator, "bath_profile_current_slot", None)
-        chosen = None
-        if current_slot is not None:
-            chosen = next((p for p in presets if p.get("slot") == current_slot), None)
-        if chosen is None and current_name:
-            chosen = next((p for p in presets if p.get("label") == current_name or p.get("name") == current_name), None)
-        if chosen is None and presets:
-            chosen = presets[0]
-        if not chosen:
+        try:
+            presets = getattr(self.coordinator, "bath_profile_options", []) or []
+            if not isinstance(presets, list):
+                LOGGER.warning("%s - bath_profile_options is not a list: %s", DOMAIN, type(presets))
+                presets = []
+            current_name = getattr(self.coordinator, "bath_profile_current", None)
+            current_slot = getattr(self.coordinator, "bath_profile_current_slot", None)
+            chosen = None
+            if current_slot is not None:
+                chosen = next((p for p in presets if isinstance(p, dict) and p.get("slot") == current_slot), None)
+            if chosen is None and current_name:
+                chosen = next((p for p in presets if isinstance(p, dict) and (p.get("label") == current_name or p.get("name") == current_name)), None)
+            if chosen is None and presets:
+                chosen = presets[0] if isinstance(presets[0], dict) else None
+            if not chosen or not isinstance(chosen, dict):
+                return None, None
+            return to_int(chosen.get("temp")), to_int(chosen.get("vol"))
+        except Exception as err:  # pylint: disable=broad-except
+            LOGGER.error("%s - Error in _current_profile: %s", DOMAIN, err, exc_info=True)
             return None, None
-        return to_int(chosen.get("temp")), to_int(chosen.get("vol"))
 
     def _is_active(self) -> bool:
         data = self.coordinator.data or {}
