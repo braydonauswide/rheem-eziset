@@ -124,6 +124,12 @@ async def _ensure_bath_profile_input_select(
             )
     except Exception as err:  # pylint: disable=broad-except
         LOGGER.error("%s - Failed to create/update input_select helper: %s", DOMAIN, err, exc_info=True)
+        # Still set coordinator state even if helper creation failed
+        # This allows the switch to work even if input_select is unavailable
+        current_slot = next((p.get("slot") for p in presets if p.get("label") == initial), None) if initial and presets else None
+        coordinator.bath_profile_options = presets  # type: ignore[attr-defined]
+        coordinator.bath_profile_current = initial  # type: ignore[attr-defined]
+        coordinator.bath_profile_current_slot = current_slot  # type: ignore[attr-defined]
         return None
 
     # Track coordinator state
