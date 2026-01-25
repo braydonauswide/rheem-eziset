@@ -46,6 +46,13 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
                 presets = []
             current_name = getattr(self.coordinator, "bath_profile_current", None)
             current_slot = getattr(self.coordinator, "bath_profile_current_slot", None)
+            LOGGER.debug(
+                "%s current_profile presets=%d current_name=%s current_slot=%s",
+                DOMAIN,
+                len(presets),
+                current_name,
+                current_slot,
+            )
             chosen = None
             if current_slot is not None:
                 chosen = next((p for p in presets if isinstance(p, dict) and p.get("slot") == current_slot), None)
@@ -54,6 +61,7 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
             if chosen is None and presets:
                 chosen = presets[0] if isinstance(presets[0], dict) else None
             if not chosen or not isinstance(chosen, dict):
+                LOGGER.warning("%s - No valid bath profile resolved; presets=%s", DOMAIN, presets)
                 return None, None
             return to_int(chosen.get("temp")), to_int(chosen.get("vol"))
         except Exception as err:  # pylint: disable=broad-except
@@ -69,7 +77,9 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
         """Start bath fill using selected profile."""
         temp, vol = self._current_profile()
         if temp is None or vol is None:
-            raise HomeAssistantError("No valid bath profile selected. Configure bath fill presets in Options.")
+            raise HomeAssistantError(
+                "No valid bath profile selected. Configure bath fill presets in Options and ensure the Bath Profile input_select is created."
+            )
         await self.coordinator.api.async_start_bath_fill(temp, vol, origin="user", entity_id=self.entity_id)
         self._attr_is_on = True
         self._desired_on = True

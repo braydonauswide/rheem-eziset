@@ -37,6 +37,13 @@ def _build_presets(entry: ConfigEntry) -> list[dict]:
     presets: list[dict] = []
     opts = entry.options
     use_defaults = not any(key.startswith("bathfill_preset_") for key in opts)
+    LOGGER.debug(
+        "%s preset build start entry_id=%s use_defaults=%s options_keys=%s",
+        DOMAIN,
+        entry.entry_id,
+        use_defaults,
+        [k for k in opts.keys() if k.startswith("bathfill_preset_")],
+    )
 
     def _format_label(name: str, slot: int, temp: int | None, vol: int | None) -> str:
         """Format a stable, user-friendly label for an enabled preset."""
@@ -58,6 +65,15 @@ def _build_presets(entry: ConfigEntry) -> list[dict]:
             continue
         label = _format_label(str(name), idx, int(temp), int(vol))
         presets.append({"name": str(name), "temp": int(temp), "vol": int(vol), "slot": idx, "label": label})
+    if not presets:
+        LOGGER.warning(
+            "%s - No enabled bath presets after build; use_defaults=%s options_present=%s",
+            DOMAIN,
+            use_defaults,
+            any(key.startswith("bathfill_preset_") for key in opts),
+        )
+    else:
+        LOGGER.debug("%s preset build complete count=%d labels=%s", DOMAIN, len(presets), [p.get("label") for p in presets])
     return presets
 
 
@@ -122,6 +138,14 @@ async def _ensure_bath_profile_input_select(
                 },
                 blocking=True,
             )
+        LOGGER.debug(
+            "%s input_select helper ready entity_id=%s options=%s initial=%s existing=%s",
+            DOMAIN,
+            entity_id,
+            displayed_options,
+            initial,
+            bool(existing_state),
+        )
     except Exception as err:  # pylint: disable=broad-except
         LOGGER.error("%s - Failed to create/update input_select helper: %s", DOMAIN, err, exc_info=True)
         # Still set coordinator state even if helper creation failed
@@ -179,6 +203,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator.data = coordinator.data or {}
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    # Initialize coordinator bath profile state to safe defaults before helper setup
+    coordinator.bath_profile_options = []  # type: ignore[attr-defined]
+    coordinator.bath_profile_current = None  # type: ignore[attr-defined]
+    coordinator.bath_profile_current_slot = None  # type: ignore[attr-defined]
 
     # Create/refresh bath profile input_select helper (replaces old select entity)
     await _ensure_bath_profile_input_select(hass, entry, coordinator)
