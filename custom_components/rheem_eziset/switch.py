@@ -58,6 +58,34 @@ class BathFillSwitch(RheemEziSETEntity, SwitchEntity):
                 chosen = next((p for p in presets if isinstance(p, dict) and p.get("slot") == current_slot), None)
             if chosen is None and current_name:
                 chosen = next((p for p in presets if isinstance(p, dict) and (p.get("label") == current_name or p.get("name") == current_name)), None)
+            
+            # Fallback: if coordinator selection is missing, read from state machine
+            # Check base entity_id first, then check for suffixes (_2, _3, etc.) if needed
+            if chosen is None and self.hass:
+                try:
+                    from homeassistant.components.input_select import DOMAIN as INPUT_SELECT_DOMAIN
+                    entry_id_prefix = self.entry.entry_id[:8].lower()
+                    base_entity_id = f"{INPUT_SELECT_DOMAIN}.rheem_{entry_id_prefix}_bath_profile"
+                    
+                    # Try base entity_id first
+                    state = self.hass.states.get(base_entity_id)
+                    if not state or not state.state:
+                        # If base entity not found, try with suffixes (storage collection may have created duplicates)
+                        for suffix in ["_2", "_3", "_4", "_5"]:
+                            suffixed_entity_id = f"{base_entity_id}{suffix}"
+                            state = self.hass.states.get(suffixed_entity_id)
+                            if state and state.state:
+                                LOGGER.debug("%s - Found entity with suffix: %s", DOMAIN, suffixed_entity_id)
+                                break
+                    
+                    if state and state.state:
+                        selected_option = state.state
+                        chosen = next((p for p in presets if isinstance(p, dict) and (p.get("label") == selected_option or p.get("name") == selected_option)), None)
+                        if chosen:
+                            LOGGER.debug("%s - Resolved profile from state machine: %s", DOMAIN, selected_option)
+                except Exception as fallback_err:  # pylint: disable=broad-except
+                    LOGGER.debug("%s - Fallback state read failed: %s", DOMAIN, fallback_err)
+            
             if chosen is None and presets:
                 chosen = presets[0] if isinstance(presets[0], dict) else None
             if not chosen or not isinstance(chosen, dict):

@@ -26,6 +26,7 @@ coverage.xml
 config/*
 !config/configuration.yaml
 custom_components/rheem_eziset/debug.log
+.ha_token
 
 # Development files (not needed for production users)
 .devcontainer.json

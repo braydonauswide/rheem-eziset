@@ -98,13 +98,13 @@ homekit:
     mode: bridge
     filter:
       include_entities:
-        - input_select.<your_entity_id_for_bath_profile>
+        - input_select.rheem_<entryIdPrefix>_bath_profile
         - switch.<your_entity_id_for_bath_fill>
         - switch.<your_entity_id_for_exit_bath_fill>
         - sensor.<your_entity_id_for_bath_fill_status>
         - sensor.<your_entity_id_for_bath_fill_progress>
     entity_config:
-      input_select.<your_entity_id_for_bath_profile>:
+      input_select.rheem_<entryIdPrefix>_bath_profile:
         type: faucet
       switch.<your_entity_id_for_bath_fill>:
         type: faucet
@@ -117,7 +117,9 @@ homekit:
 
 Notes:
 - Do not rename entity_ids after pairing to HomeKit; it can create duplicate accessories.
-- The Bath Profile entity is an `input_select` entity (HomeKit-friendly); its options show labels with temperature and volume (e.g., "Children (Slot 1, 39C, 110L)").
+- The Bath Profile entity is an `input_select` entity (HomeKit-friendly); its options show labels with temperature and volume (e.g., "Children (39C, 110L)").
+- **Bath Profile entity_id format**: `input_select.rheem_<entryIdPrefix>_bath_profile` where `<entryIdPrefix>` is the first 8 characters of your config entry ID (lowercase, stable even if you rename the device). Find your entry ID in Settings → Devices & Services → Rheem EziSET HomeKit → Configure, or check HA logs during integration setup.
+- **Note**: If you see an entity with a suffix like `_2` (e.g., `input_select.rheem_<entryIdPrefix>_bath_profile_2`), this is normal and the integration handles it automatically. The entity name is "Bath Profile" (no IP address) and options don't include slot numbers for cleaner HomeKit display.
 - If the device stops responding after rapid toggles, it may be in DoS lockout; wait for cooldown or power-cycle the heater/bridge.
 - UI alternative: in the HomeKit Bridge integration (UI), add only the Bath Profile selector, Bath Fill switch, and Exit Bath Fill to the include filter. Per-entity `entity_config` (e.g., `type: faucet`) may require YAML depending on HA version.
 - When starting Bath Fill, the integration aligns the heater’s target temperature to the Bath Fill temperature and may cancel any pending/optimistic temp change; after Bath Fill ends, the previous temp is restored when the heater is idle.

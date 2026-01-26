@@ -356,23 +356,47 @@ def _resolve_entity_ids(entry_id: str, registry_entries: list[dict[str, Any]]) -
     def optional(uid: str) -> str | None:
         return by_unique.get(uid)
 
-    # Try to find bath profile input_select entity (registered under input_select domain)
+    # Compute expected bath profile input_select entity_id (stable format)
+    # Use lowercase since HA lowercases entity_ids automatically
+    entry_id_prefix = entry_id[:8].lower()
+    expected_bath_profile = f"input_select.rheem_{entry_id_prefix}_bath_profile"
+    
+    # Try to find bath profile input_select entity
+    # First, check if it matches the expected format in registry (unlikely, but possible)
     bath_profile = optional(f"{entry_id}-bath_profile_input_select")
     if not bath_profile:
         # Fallback: try old select entity
         bath_profile = optional(f"{entry_id}-bath_profile")
     if not bath_profile:
-        # Look for input_select entities first (preferred)
-        for eid, e in by_entity_id.items():
-            if eid.startswith("input_select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
-                bath_profile = eid
-                break
-        # Fallback: look for select entities
-        if not bath_profile:
+        # Check if expected entity_id exists in registry (unlikely for input_select helpers)
+        if expected_bath_profile in by_entity_id:
+            bath_profile = expected_bath_profile
+        else:
+            # Look for input_select entities first (preferred)
+            # Also check for entities with suffixes (_2, _3, etc.) that might exist
             for eid, e in by_entity_id.items():
-                if eid.startswith("select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
-                    bath_profile = eid
-                    break
+                if eid.startswith("input_select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
+                    # Prefer exact match, but accept suffix matches
+                    if eid == expected_bath_profile or eid.startswith(f"{expected_bath_profile}_"):
+                        bath_profile = eid
+                        break
+            # If no exact or suffix match found, take any matching entity
+            if not bath_profile:
+                for eid, e in by_entity_id.items():
+                    if eid.startswith("input_select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
+                        bath_profile = eid
+                        break
+            # Fallback: look for select entities
+            if not bath_profile:
+                for eid, e in by_entity_id.items():
+                    if eid.startswith("select.") and ("bath" in eid.lower() or "profile" in eid.lower()):
+                        bath_profile = eid
+                        break
+    
+    # If not found in registry, try to verify via REST API (check base and suffixes)
+    if not bath_profile:
+        # Will be verified later via REST API, but use expected as default
+        bath_profile = expected_bath_profile
 
     return EntityIds(
         water_heater=need(f"{entry_id}-water-heater"),
@@ -820,6 +844,45 @@ async def async_main() -> int:
 
         reg = await list_entry_entities(ws, entry_id)
         ids = _resolve_entity_ids(entry_id, reg)
+        
+        # Verify bath profile input_select entity exists via REST API (not in registry)
+        # Handle cases where entity might have a suffix (_2, _3, etc.)
+        if ids.bath_profile_select and ids.bath_profile_select.startswith("input_select."):
+            bath_profile_entity_id = None
+            # First try the resolved entity_id
+            try:
+                bath_profile_state = await rest.get_state(ids.bath_profile_select)
+                bath_profile_entity_id = ids.bath_profile_select
+            except Exception:
+                # If that fails, try with suffixes
+                base_entity_id = ids.bath_profile_select
+                for suffix in ["", "_2", "_3", "_4", "_5"]:
+                    try:
+                        test_entity_id = f"{base_entity_id}{suffix}" if suffix else base_entity_id
+                        bath_profile_state = await rest.get_state(test_entity_id)
+                        bath_profile_entity_id = test_entity_id
+                        # Update ids for use in tests
+                        ids.bath_profile_select = test_entity_id
+                        break
+                    except Exception:
+                        continue
+            
+            if bath_profile_entity_id:
+                try:
+                    bath_profile_state = await rest.get_state(bath_profile_entity_id)
+                    options = bath_profile_state.get("attributes", {}).get("options", [])
+                    print(f"bath profile input_select verified: {bath_profile_entity_id} (options: {len(options)})")
+                    # Select first option if available (for tests that need a valid selection)
+                    if options and bath_profile_state.get("state") not in options:
+                        try:
+                            await rest.call_service("input_select", "select_option", {"entity_id": bath_profile_entity_id, "option": options[0]})
+                            print(f"  selected first option: {options[0]}")
+                        except Exception:
+                            pass  # Best effort
+                except Exception as verify_err:
+                    print(f"WARNING: bath profile entity verification failed: {verify_err}", file=sys.stderr)
+            else:
+                print(f"WARNING: bath profile entity not found (tried base and suffixes): {ids.bath_profile_select}", file=sys.stderr)
 
         if args.suite == "discover":
             print(f"entities for entry: {len(reg)}")

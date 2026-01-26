@@ -10,7 +10,7 @@ NAME = "Rheem EziSET Water Heater"
 IDPREFIX = "rheem_water_heater_"
 DOMAIN = "rheem_eziset"
 MANUFACTURER = "Rheem"
-VERSION = "2.0.2"  # Note: Use manifest_version() from manifest.py for runtime version
+VERSION = "2.0.3"  # Note: Use manifest_version() from manifest.py for runtime version
 PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
