@@ -10,7 +10,7 @@ NAME = "Rheem EziSET Water Heater"
 IDPREFIX = "rheem_water_heater_"
 DOMAIN = "rheem_eziset"
 MANUFACTURER = "Rheem"
-VERSION = "2.0.3"  # Note: Use manifest_version() from manifest.py for runtime version
+VERSION = "2.0.4"  # Note: Use manifest_version() from manifest.py for runtime version
 PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
@@ -21,7 +21,7 @@ PLATFORMS: list[Platform] = [
 
 # SCAN INTERVAL
 CONF_SCAN_INTERVAL = "scan_interval"
-DEFAULT_SCAN_INTERVAL = 3  # seconds (still well above MIN_REQUEST_GAP 1.5s)
+DEFAULT_SCAN_INTERVAL = 2.5  # seconds (optimized from 3s - still safe, well above MIN_REQUEST_GAP 1.5s)
 
 # Presets
 PRESET_SLOTS = 6

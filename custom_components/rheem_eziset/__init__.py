@@ -455,14 +455,80 @@ async def _ensure_bath_profile_input_select(
         if not new_state:
             return
         option = new_state.state
+        if not option:
+            return
+        option = option.strip()  # Strip whitespace for matching
         # Get current presets (they may have changed)
         current_presets = getattr(coordinator, "bath_profile_options", []) or []
-        if option in [p.get("label", p.get("name", "")) for p in current_presets]:
-            coordinator.bath_profile_current = option  # type: ignore[attr-defined]
-            coordinator.bath_profile_current_slot = next(  # type: ignore[attr-defined]
-                (p.get("slot") for p in current_presets if p.get("label") == option or p.get("name") == option),
-                None,
+        
+        LOGGER.info("%s - State change detected: option='%s', available presets: %s", 
+                   DOMAIN, option, [p.get("label") for p in current_presets])
+        
+        matched_preset = None
+        
+        # Try exact match first (label or name)
+        matched_preset = next(
+            (p for p in current_presets if isinstance(p, dict) and (
+                p.get("label", "").strip() == option or
+                p.get("name", "").strip() == option
+            )),
+            None
+        )
+        if matched_preset:
+            LOGGER.info("%s - State change: exact match found for '%s' -> slot=%d", DOMAIN, option, matched_preset.get("slot"))
+        
+        # Try case-insensitive match if exact match failed
+        if not matched_preset:
+            option_lower = option.lower()
+            matched_preset = next(
+                (p for p in current_presets if isinstance(p, dict) and (
+                    p.get("label", "").strip().lower() == option_lower or
+                    p.get("name", "").strip().lower() == option_lower
+                )),
+                None
             )
+            if matched_preset:
+                LOGGER.info("%s - State change: case-insensitive match found for '%s' -> slot=%d", DOMAIN, option, matched_preset.get("slot"))
+        
+        # OPTIMIZATION: Try partial/fuzzy match with best match selection (same logic as switch.py)
+        if not matched_preset:
+            option_lower = option.lower()
+            selected_name_part = option_lower.split('(')[0].split('[')[0].strip()
+            if selected_name_part:
+                potential_matches = []
+                for p in current_presets:
+                    if not isinstance(p, dict):
+                        continue
+                    preset_name = p.get("name", "").strip().lower()
+                    preset_label = p.get("label", "").strip().lower()
+                    
+                    name_match = preset_name.startswith(selected_name_part) if preset_name else False
+                    label_match = preset_label.startswith(selected_name_part) if preset_label else False
+                    
+                    if name_match or label_match:
+                        match_quality = 0
+                        if preset_name == selected_name_part:
+                            match_quality = 100  # Exact name match
+                        elif preset_name.startswith(selected_name_part):
+                            match_quality = len(preset_name)  # Longer names are better matches
+                        elif label_match:
+                            match_quality = 50  # Label match is less preferred
+                        potential_matches.append((match_quality, p))
+                
+                if potential_matches:
+                    potential_matches.sort(key=lambda x: x[0], reverse=True)
+                    matched_preset = potential_matches[0][1]
+                    LOGGER.info("%s - State change: partial match found for '%s' -> slot=%d (quality=%d)", 
+                              DOMAIN, option, matched_preset.get("slot"), potential_matches[0][0])
+        
+        if matched_preset:
+            coordinator.bath_profile_current = option  # type: ignore[attr-defined]
+            coordinator.bath_profile_current_slot = matched_preset.get("slot")  # type: ignore[attr-defined]
+            LOGGER.info("%s - State change: updated profile to '%s' (slot=%d, temp=%d, vol=%d)", 
+                       DOMAIN, option, matched_preset.get("slot"), matched_preset.get("temp"), matched_preset.get("vol"))
+        else:
+            LOGGER.warning("%s - State change: option '%s' not found in presets. Available: %s", 
+                          DOMAIN, option, [f"{p.get('label')} (name: {p.get('name')})" for p in current_presets])
     
     unsub = async_track_state_change_event(hass, [entity_id], _handle_state_change)
     entry.async_on_unload(unsub)
@@ -486,16 +552,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     host = entry.data.get(CONF_HOST)
     api = RheemEziSETApi(hass=hass, host=host)
+    api._config_entry = entry  # Store reference for session persistence
+    # Restore session ID from storage if available
+    try:
+        await api._restore_session_id(entry)
+    except Exception as err:  # pylint: disable=broad-except
+        LOGGER.debug("%s - Failed to restore session ID on startup: %s", DOMAIN, err)
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 
     coordinator = RheemEziSETDataUpdateCoordinator(hass, api=api, update_interval=scan_interval, config_entry=entry)
     try:
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:  # pylint: disable=broad-except
-        LOGGER.warning("%s - Initial refresh failed: %s. Proceeding to register entry so Options/UI remain usable.", DOMAIN, err)
+        LOGGER.warning("%s - Initial refresh failed: %s. Proceeding to register entry so Options/UI remain usable. Will retry in background.", DOMAIN, err)
         # Ensure platforms can still set up even if the first refresh failed.
         # Many entities read coordinator.data during __init__.
         coordinator.data = coordinator.data or {}
+        # Schedule a background retry to fetch data as soon as possible
+        async def _retry_initial_refresh():
+            """Retry initial data fetch in background."""
+            try:
+                await asyncio.sleep(2.0)  # Brief delay to allow setup to complete
+                await coordinator.async_refresh()
+                LOGGER.info("%s - Background retry of initial refresh succeeded", DOMAIN)
+            except Exception as retry_err:
+                LOGGER.debug("%s - Background retry of initial refresh failed: %s", DOMAIN, retry_err)
+                # Coordinator will continue with scheduled updates
+        hass.async_create_task(_retry_initial_refresh())
     # Ensure coordinator.data is always a dict (some entities assume .data is not None)
     coordinator.data = coordinator.data or {}
 

@@ -127,21 +127,56 @@ class RheemEziSETWaterHeater(RheemEziSETEntity, WaterHeaterEntity):
 
     @property
     def current_temperature(self):
-        """Return the current temperature ."""
-        result = (self.coordinator.data or {}).get("temp")
+        """Return the current temperature."""
+        data = self.coordinator.data or {}
+        api = self.coordinator.api
+        
+        # First, check if device reports temperature (most authoritative)
+        result = to_int(data.get("temp"))
         if result is not None:
             self.rheem_current_temperature = result
             return result
+        
+        # If device doesn't report temp, check if we're in bath fill mode
+        # During bath fill, use the bath fill target temperature as fallback
+        # (the device may not report temp during bath fill mode)
+        bathfill_engaged = bool(api._bathfill_engaged(data))
+        if bathfill_engaged:
+            bathfill_target = to_int(data.get("bathfill_target_temp"))
+            if bathfill_target is not None:
+                # Update cache for consistency
+                self.rheem_current_temperature = bathfill_target
+                return bathfill_target
+        
+        # Last resort: use cached value
         return self.rheem_current_temperature
 
     @property
     def target_temperature(self):
         """Return the target temperature or the current temperature if there is no target."""
-        bathfill_target = to_int((self.coordinator.data or {}).get("bathfill_target_temp"))
+        # Check device-reported target first (most authoritative)
+        data = self.coordinator.data or {}
+        device_reqtemp = to_int(data.get("reqtemp"))
+        device_settemp = to_int(data.get("setTemp"))
+        device_target = device_reqtemp or device_settemp
+        
+        # Bath fill target takes precedence if bath fill is active
+        bathfill_target = to_int(data.get("bathfill_target_temp"))
         if bathfill_target is not None:
             return bathfill_target
+        
+        # Use device-reported target if available (from latest poll or API response)
+        if device_target is not None:
+            # Update our cached value to match device
+            if self.rheem_target_temperature != device_target:
+                self.rheem_target_temperature = device_target
+            return device_target
+        
+        # Fall back to cached value if set (user just changed it, waiting for device confirmation)
         if self.rheem_target_temperature is not None:
             return self.rheem_target_temperature
+        
+        # Last resort: use current temperature
         current = self.current_temperature
         if current is not None:
             return current

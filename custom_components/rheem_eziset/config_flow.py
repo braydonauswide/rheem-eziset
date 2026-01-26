@@ -261,7 +261,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             to_int(existing.get(CONF_SCAN_INTERVAL)) or DEFAULT_SCAN_INTERVAL,
                         )
                     },
-                    default=max(2, to_int(existing.get(CONF_SCAN_INTERVAL)) or DEFAULT_SCAN_INTERVAL),
+                    default=max(2, int(to_int(existing.get(CONF_SCAN_INTERVAL)) or DEFAULT_SCAN_INTERVAL)),
                 ): vol.All(vol.Coerce(int), vol.Range(min=2)),
             }
 

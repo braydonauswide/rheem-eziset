@@ -15,8 +15,10 @@ from typing import Any
 from aiohttp import ClientError, ClientConnectorError, ClientTimeout
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.water_heater import WaterHeaterEntity
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import ConditionErrorMessage, HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN, LOGGER
 from .util import is_one, to_float, to_int
@@ -25,6 +27,10 @@ from .manifest import manifest_version
 DEBUG_LOG_PATH = "/config/custom_components/rheem_eziset/debug.log"
 DEBUG_SESSION_ID = "debug-session"
 DEBUG_RUN_ID = "pre-fix"
+
+# Session ID persistence
+STORAGE_KEY = f"{DOMAIN}_session"
+STORAGE_VERSION = 1
 
 
 def _agent_log(hypothesis: str, location: str, message: str, data: dict[str, Any]) -> None:
@@ -114,6 +120,9 @@ class RheemEziSETApi:
         self._prev_temp_for_bathfill: int | None = None
         self._pending_restore_temp: int | None = None
         self._bathfill_target_temp: int | None = None
+        self._bathfill_target_vol: int | None = None  # Target volume for fill percent calculation
+        self._last_fill_percent: float | None = None  # Last known fill percent from device
+        self._last_fill_percent_timestamp: float = 0.0  # Timestamp of last known fill percent
         self._cancel_user_settemp: bool = False
         # Default to a longer session timer so bath fill doesn't expire while waiting for user actions.
         self._control_session_timer: int = 600
@@ -137,6 +146,7 @@ class RheemEziSETApi:
         self._control_cooldown_until: float = 0.0
         self._connection_failures: int = 0
         self._connection_backoff_until: float = 0.0
+        self._config_entry: ConfigEntry | None = None  # Store for session persistence
         self._init_debug_log()
 
     # ---------------------------------------------------------
@@ -198,6 +208,52 @@ class RheemEziSETApi:
             data.pop("bathfill_target_temp", None)
         return data
 
+    async def _save_session_id(self, entry: ConfigEntry, sid: int | None) -> None:
+        """Save session ID to storage."""
+        try:
+            store = Store(self.hass, STORAGE_VERSION, STORAGE_KEY)
+            data = await store.async_load() or {}
+            if sid is not None:
+                data[entry.entry_id] = {"sid": sid, "timestamp": time.time()}
+            else:
+                data.pop(entry.entry_id, None)
+            await store.async_save(data)
+            LOGGER.debug("%s - Saved session ID %s for entry %s", DOMAIN, sid, entry.entry_id)
+        except Exception as err:
+            LOGGER.debug("%s - Failed to save session ID: %s", DOMAIN, err)
+
+    async def _restore_session_id(self, entry: ConfigEntry) -> int | None:
+        """Restore and validate session ID from storage."""
+        try:
+            store = Store(self.hass, STORAGE_VERSION, STORAGE_KEY)
+            data = await store.async_load() or {}
+            entry_data = data.get(entry.entry_id)
+            if not entry_data:
+                return None
+            
+            stored_sid = entry_data.get("sid")
+            if stored_sid is None:
+                return None
+            
+            # Validate session is still active (check device state)
+            info = await self._enqueue_request("getInfo.cgi")
+            current_sid = to_int(info.get("sid"))
+            s_timeout = to_int(info.get("sTimeout"))
+            
+            # Session is valid if device reports the same sid
+            if current_sid == stored_sid:
+                self._owned_sid = stored_sid
+                LOGGER.info("%s - Restored session ID %s from storage", DOMAIN, stored_sid)
+                return stored_sid
+            else:
+                # Session expired - clear it
+                LOGGER.debug("%s - Stored session ID %s is no longer valid (current_sid=%s, sTimeout=%s)", DOMAIN, stored_sid, current_sid, s_timeout)
+                await self._save_session_id(entry, None)
+                return None
+        except Exception as err:
+            LOGGER.debug("%s - Failed to restore session ID: %s", DOMAIN, err)
+            return None
+
     def _log_action(self, action: str, stage: str, *, control_seq_id: str | None = None, extra: dict[str, Any] | None = None) -> None:
         """Emit an action log with snapshot + extras."""
         payload = {
@@ -255,12 +311,59 @@ class RheemEziSETApi:
         """Ensure the request worker is running."""
         if self._request_worker_task and not self._request_worker_task.done():
             return
+        
+        # If task exists but is done, check if it completed successfully or crashed
+        if self._request_worker_task and self._request_worker_task.done():
+            try:
+                # Check if task raised an exception
+                self._request_worker_task.result()
+            except Exception as task_err:
+                LOGGER.error(
+                    "%s - Request worker task crashed: %s. Restarting worker.",
+                    DOMAIN,
+                    task_err,
+                    exc_info=True,
+                )
+            self._request_worker_task = None
+        
         try:
             loop = asyncio.get_running_loop()
             self._request_worker_task = loop.create_task(self._request_worker())
-            self._request_worker_task.add_done_callback(lambda _: None)
-        except Exception:
+            
+            def _handle_worker_done(task: asyncio.Task) -> None:
+                """Handle worker task completion (success or failure)."""
+                if task.done():
+                    try:
+                        task.result()  # Check for exceptions
+                    except Exception as err:
+                        LOGGER.error(
+                            "%s - Request worker task failed: %s",
+                            DOMAIN,
+                            err,
+                            exc_info=True,
+                        )
+                        # Worker crashed - will be restarted on next _ensure_request_worker call
+            
+            self._request_worker_task.add_done_callback(_handle_worker_done)
+            LOGGER.debug("%s - Request worker task started", DOMAIN)
+        except RuntimeError as err:
+            # No running event loop - this should not happen in async context
+            LOGGER.error(
+                "%s - Cannot start request worker: no running event loop: %s",
+                DOMAIN,
+                err,
+            )
             self._request_worker_task = None
+            raise
+        except Exception as err:
+            LOGGER.error(
+                "%s - Failed to start request worker task: %s",
+                DOMAIN,
+                err,
+                exc_info=True,
+            )
+            self._request_worker_task = None
+            raise
 
     async def _enqueue_request(
         self,
@@ -274,7 +377,21 @@ class RheemEziSETApi:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         await self._request_queue.put((path, op_id, control_seq_id, allow_read_timeout, fut))
-        self._ensure_request_worker()
+        
+        # Ensure worker is running - raise error if it can't be started
+        try:
+            self._ensure_request_worker()
+            # Verify worker task is actually running
+            if not self._request_worker_task or self._request_worker_task.done():
+                raise RuntimeError(f"{DOMAIN} - Request worker task is not running")
+        except Exception as err:
+            # Worker failed to start - cancel the future and raise
+            if not fut.cancelled():
+                fut.cancel()
+            raise HomeAssistantError(
+                f"{DOMAIN} - Failed to start request worker: {err}"
+            ) from err
+        
         return await fut
 
     async def _request_worker(self) -> None:
@@ -445,10 +562,17 @@ class RheemEziSETApi:
                             )
                             if isinstance(reason, str):
                                 if reason == "sTimeout_active":
-                                    self._apply_control_cooldown(reason, base=12.0)
+                                    # Reduced from 12.0s to 2.0s - sTimeout is often transient
+                                    # This is an artificial delay, not a device requirement
+                                    # Aligns with test findings: device can handle 2.4s gaps, so 2s cooldown is safe
+                                    self._apply_control_cooldown(reason, base=2.0)
                                 elif reason.startswith("mode_busy") or reason in {"invalid_mode", "invalid_flow", "flow_active", "bathfill_active"}:
-                                    self._apply_control_cooldown(reason, base=8.0)
+                                    # Reduced from 8.0s to 2.0s - mode/flow conditions are often transient
+                                    # This is an artificial delay, not a device requirement
+                                    # Aligns with test findings: device can handle 2.4s gaps, so 2s cooldown is safe
+                                    self._apply_control_cooldown(reason, base=2.0)
                                 elif reason == "write_lock_in_use":
+                                    # Keep at 5.0s - write lock is a real contention issue (not transient)
                                     self._apply_control_cooldown(reason, base=5.0)
                         break
 
@@ -852,6 +976,15 @@ class RheemEziSETApi:
                         f"{DOMAIN} - Device lockout suspected; backing off until {self._lockout_until_monotonic}"
                     )
 
+        # Restore session ID from storage if we don't have it in memory (e.g., after restart)
+        if not self._owned_sid and self._config_entry:
+            try:
+                restored_sid = await self._restore_session_id(self._config_entry)
+                if restored_sid:
+                    LOGGER.debug("%s - Restored session ID %s from storage in async_get_data", DOMAIN, restored_sid)
+            except Exception as err:
+                LOGGER.debug("%s - Failed to restore session ID in async_get_data: %s", DOMAIN, err)
+
         if self._write_lock.locked() and self._last_info is not None:
             # A control sequence is in-flight; avoid adding extra requests—return last known data.
             merged: dict[str, Any] = {}
@@ -960,31 +1093,37 @@ class RheemEziSETApi:
                         )
                     if resp is not None and not resp.get("_timeout"):
                         self._owned_sid = None
+                        # Clear from storage
+                        if self._config_entry:
+                            await self._save_session_id(self._config_entry, None)
+                # Clear from storage
+                if self._config_entry:
+                    await self._save_session_id(self._config_entry, None)
 
         # If bath fill not active anymore, allow temp changes again.
         if not self._bathfill_active(info):
             self._cancel_user_settemp = False
-            # Try pending restore if idle/flow=0
+            # OPTIMIZATION: Attempt temperature restore in background if pending and device is ready
+            # This allows restore to happen asynchronously without blocking bath fill start
             if self._pending_restore_temp is not None:
-                mode_val = to_int(info.get("mode"))
-                flow_val = to_float(info.get("flow"))
-                if mode_val in (5, None) and flow_val in (0, None):
-                    pending_temp = self._pending_restore_temp
-                    if pending_temp is not None:
-                        if "restore_temp" not in self._pending_writes:
-                            self._log_action(
-                                "restore_temp",
-                                "enqueue",
-                                control_seq_id="bathfill_restore",
-                                extra={"temp": pending_temp},
-                            )
-                        self._enqueue_write(
-                            "restore_temp",
-                            {
-                                "temp": pending_temp,
-                                "entity_id": None,
-                            },
-                        )
+                mode_val = to_int(merged.get("mode"))
+                flow_val = to_float(merged.get("flow"))
+                s_timeout_val = to_int(merged.get("sTimeout"))
+                # Only attempt restore if device is idle AND no active session timeout
+                if mode_val in (5, None) and flow_val in (0, None) and s_timeout_val in (0, None):
+                    restore_temp = self._pending_restore_temp
+                    self._pending_restore_temp = None
+                    # Enqueue restore as background operation (non-blocking)
+                    self._enqueue_write(
+                        "restore_temp",
+                        {
+                            "temp": restore_temp,
+                            "control_seq_id": "bathfill_restore_background",
+                            "origin": "system",
+                            "entity_id": None,
+                        },
+                    )
+                    LOGGER.info("%s - Enqueued background temperature restore to %d°C", DOMAIN, restore_temp)
 
         mode_val = to_int(merged.get("mode"))
         state_val = to_int(merged.get("state"))
@@ -998,21 +1137,80 @@ class RheemEziSETApi:
 
         completion = (not self._ignore_completion_state) and (mode_val == 35 or state_val == 3)
         if completion:
+            # Force fillPercent to 100% at completion for UI consistency
             if fill_percent is None or fill_percent < 100:
                 merged["fillPercent"] = 100.0
                 fill_percent = 100.0
+                # Also update _last_info so forced value persists in snapshots and future polls
+                if self._last_info:
+                    self._last_info["fillPercent"] = 100.0
             self._completion_latched = True
-        elif not device_bathfill_active and self._completion_latched:
-            if mode_val in (5, None) and flow_val in (0, None):
-                merged["fillPercent"] = 0.0
-                self._completion_latched = False
-                self._bathfill_latched = False
+            # Update tracking with completion value
+            self._last_fill_percent = 100.0
+            self._last_fill_percent_timestamp = time.monotonic()
+        elif device_bathfill_active and self._bathfill_target_vol is not None:
+            # OPTIMIZATION: Calculate estimated fill percent based on flow rate between polls
+            # This provides smooth, real-time progress updates instead of waiting for device updates
+            now = time.monotonic()
+            time_since_last_update = now - self._last_fill_percent_timestamp if self._last_fill_percent_timestamp > 0 else 0.0
+            
+            # If device provided a new fillPercent value, use it and update tracking
+            if fill_percent is not None:
+                # Device provided actual value - correct our estimate
+                self._last_fill_percent = fill_percent
+                self._last_fill_percent_timestamp = now
+                merged["fillPercent"] = fill_percent
+            elif self._last_fill_percent is not None and flow_val is not None and flow_val > 0 and time_since_last_update > 0:
+                # Estimate fill percent based on flow rate since last known value
+                # Flow is in L/min, convert to L/sec and multiply by elapsed time
+                flow_l_per_sec = flow_val / 60.0
+                volume_added_l = flow_l_per_sec * time_since_last_update
+                
+                # Calculate estimated fill percent
+                # Use last known fill percent as baseline, add estimated progress
+                estimated_fill_percent = self._last_fill_percent + (volume_added_l / self._bathfill_target_vol * 100.0)
+                
+                # Clamp to valid range (0-100%)
+                estimated_fill_percent = max(0.0, min(100.0, estimated_fill_percent))
+                
+                # Use estimated value for display (smooth UX)
+                merged["fillPercent"] = estimated_fill_percent
+                
+                LOGGER.debug(
+                    "%s - Estimated fill percent: %.2f%% (last: %.2f%%, flow: %.2f L/min, elapsed: %.1fs, vol_added: %.2f L)",
+                    DOMAIN, estimated_fill_percent, self._last_fill_percent, flow_val, time_since_last_update, volume_added_l
+                )
+            elif self._last_fill_percent is not None:
+                # No flow or no time elapsed - use last known value
+                merged["fillPercent"] = self._last_fill_percent
+            # If no last known value and no device value, leave as None (will show as unknown)
+        # Clear latches when device is idle and not in bath fill mode
+        # BUT preserve latches if bath fill start is pending or we have an active session from bath fill
+        # This ensures both latches are cleared whenever the device is idle, unless bath fill is starting
+        elif not device_bathfill_active and (self._bathfill_latched or self._completion_latched):
+            # Check if bath fill start is pending or we have an active session
+            bathfill_start_pending = "bathfill_start" in self._pending_writes
+            has_bathfill_session = self._owned_sid is not None
+            
+            # Only clear latches if there's no pending start and no active session
+            # This preserves latches during the startup window until device enters bath fill mode
+            if not bathfill_start_pending and not has_bathfill_session:
+                if mode_val in (5, None) and flow_val in (0, None):
+                    merged["fillPercent"] = 0.0
+                    self._completion_latched = False
+                    self._bathfill_latched = False
+                    # Clear fill percent tracking when bath fill is not active
+                    self._last_fill_percent = None
+                    self._last_fill_percent_timestamp = 0.0
 
         # If completion has been explicitly cleared (exit pressed), hide stale completion state
         # and reset progress back to 0 for UI consistency.
         if self._ignore_completion_state and not device_bathfill_active and flow_val in (0, None):
             merged["fillPercent"] = 0.0
             fill_percent = 0.0
+            # Clear fill percent tracking when exit is pressed
+            self._last_fill_percent = None
+            self._last_fill_percent_timestamp = 0.0
 
         self._schedule_drain()
         return self._with_transient_fields(merged)
@@ -1024,6 +1222,15 @@ class RheemEziSETApi:
             raise HomeAssistantError(
                 f"{DOMAIN} - Device lockout suspected; backing off until {self._lockout_until_monotonic}"
             )
+
+        # Restore session ID from storage if we don't have it in memory (e.g., after restart)
+        if not self._owned_sid and self._config_entry:
+            try:
+                restored_sid = await self._restore_session_id(self._config_entry)
+                if restored_sid:
+                    LOGGER.debug("%s - Restored session ID %s from storage in async_get_info_only", DOMAIN, restored_sid)
+            except Exception as err:
+                LOGGER.debug("%s - Failed to restore session ID in async_get_info_only: %s", DOMAIN, err)
 
         if self._write_lock.locked() and self._last_info is not None:
             merged: dict[str, Any] = {}
@@ -1107,19 +1314,26 @@ class RheemEziSETApi:
         """Set parameters on Rheem."""
         async with self._write_lock:
             sid: int | None = None
+            param_start = time.monotonic()
             try:
                 attempts = 2
                 last_err: Exception | None = None
                 for attempt in range(attempts):
                     try:
+                        ctrl_start = time.monotonic()
                         ctrl_resp = await self._enqueue_request(
                             f"ctrl.cgi?sid=0&heatingCtrl=1&sessionTimer={self._control_session_timer}",
                             control_seq_id=control_seq_id,
                         )
+                        ctrl_elapsed = time.monotonic() - ctrl_start
+                        LOGGER.debug("%s - Session acquisition took %.3fs", DOMAIN, ctrl_elapsed)
                         sid_raw = ctrl_resp.get("sid")
                         sid = to_int(sid_raw)
                         if sid:
                             self._owned_sid = sid
+                            # Save to storage if we have config entry reference
+                            if self._config_entry:
+                                await self._save_session_id(self._config_entry, sid)
                         if not sid or not is_one(ctrl_resp.get("heatingCtrl")):
                             LOGGER.error("%s - Error when retrieving ctrl for set_param. Result: %s", DOMAIN, ctrl_resp)
                             if sid_raw is not None:
@@ -1131,7 +1345,10 @@ class RheemEziSETApi:
                                     )
                             raise HomeAssistantError(f"{DOMAIN} - Unable to take control to set parameter {param}")
 
+                        set_start = time.monotonic()
                         set_resp = await self._enqueue_request(f"set.cgi?sid={sid}&{param}", control_seq_id=control_seq_id)
+                        set_elapsed = time.monotonic() - set_start
+                        LOGGER.debug("%s - Set parameter took %.3fs", DOMAIN, set_elapsed)
                         resp_val = set_resp.get(response_param)
                         ok = False
                         if isinstance(response_check, int):
@@ -1143,7 +1360,21 @@ class RheemEziSETApi:
                         if not ok:
                             LOGGER.error("%s - Error when setting %s. Response: %s", DOMAIN, param, set_resp)
                             raise HomeAssistantError(f"{DOMAIN} - Unable to set {param}")
+                        # Success - clear control cooldowns to prevent delays on next operation
+                        self._control_cooldown_until = 0.0
+                        self._control_backoff_until = 0.0
+                        total_elapsed = time.monotonic() - param_start
+                        LOGGER.info("%s - _async_set_param completed in %.3fs (ctrl: %.3fs, set: %.3fs)", DOMAIN, total_elapsed, ctrl_elapsed, set_elapsed)
+                        # Update _last_info with the response to ensure state is current
+                        if set_resp:
+                            self._last_info = set_resp
+                        # Brief delay before releasing session to ensure device commits the change
+                        # OPTIMIZATION: Reduced from 0.5s to 0.3s - AGENTS.md shows device needs ~1.0s for processing,
+                        # but commit time is shorter. This improves responsiveness while still allowing device to commit.
+                        await asyncio.sleep(0.3)
                         last_err = None
+                        # Store response for return after finally block
+                        result_resp = set_resp
                         break
                     except HomeAssistantError as err:
                         last_err = err
@@ -1166,6 +1397,14 @@ class RheemEziSETApi:
                         )
                     if resp is not None and not resp.get("_timeout"):
                         self._owned_sid = None
+                        # Clear from storage
+                        if self._config_entry:
+                            await self._save_session_id(self._config_entry, None)
+                # Clear from storage
+                if self._config_entry:
+                    await self._save_session_id(self._config_entry, None)
+        # Return the response if we successfully set the parameter
+        return result_resp
 
     # ---------------------------------------------------------
     # Public control APIs (existing features)
@@ -1319,16 +1558,36 @@ class RheemEziSETApi:
     ) -> None:
         """Execute set_temp (assumes validation already done)."""
         action_ctx = {"origin": origin or ("system" if allow_bathfill_override else "user"), "entity_id": entity_id, "temp": temp}
+        start_time = time.monotonic()
         self._log_action("set_temp", "start", control_seq_id=control_seq_id, extra=action_ctx)
         try:
+            check_start = time.monotonic()
             await self._check_control_issues(
                 reset_attribute_owner=water_heater,
                 reset_attribute="rheem_current_temperature",
                 require_idle=(direction or "up") == "up",
                 allow_owned_session=(direction or "up") == "down",
-                use_cached=True,
+                use_cached=False,  # Use fresh data to avoid stale state
             )
-            await self._async_set_param(param=f"setTemp={temp}", response_param="reqtemp", response_check=temp, control_seq_id=control_seq_id)
+            check_elapsed = time.monotonic() - check_start
+            LOGGER.debug("%s - _check_control_issues took %.3fs", DOMAIN, check_elapsed)
+            
+            param_start = time.monotonic()
+            set_resp = await self._async_set_param(param=f"setTemp={temp}", response_param="reqtemp", response_check=temp, control_seq_id=control_seq_id)
+            param_elapsed = time.monotonic() - param_start
+            total_elapsed = time.monotonic() - start_time
+            LOGGER.info("%s - Temperature change completed in %.3fs (check: %.3fs, param: %.3fs)", DOMAIN, total_elapsed, check_elapsed, param_elapsed)
+            # Update water heater entity state immediately from API response
+            if water_heater and set_resp:
+                confirmed_temp = to_int(set_resp.get("reqtemp"))
+                if confirmed_temp is not None:
+                    water_heater.rheem_target_temperature = confirmed_temp
+                    # Update coordinator data immediately to prevent stale state
+                    if hasattr(self, "hass") and hasattr(water_heater, "coordinator"):
+                        # Merge the confirmed temperature into coordinator data
+                        current_data = water_heater.coordinator.data or {}
+                        updated_data = {**current_data, "reqtemp": confirmed_temp, "setTemp": confirmed_temp}
+                        water_heater.coordinator.async_set_updated_data(updated_data)
             self._log_action("set_temp", "ok", control_seq_id=control_seq_id, extra=action_ctx | {"post": self._snapshot_state()})
             if control_seq_id == "bathfill_restore":
                 self._pending_restore_temp = None
@@ -1421,6 +1680,9 @@ class RheemEziSETApi:
                 self._owned_sid = int(resp_sid)
             except Exception:
                 self._owned_sid = None
+                # Clear from storage
+                if self._config_entry:
+                    await self._save_session_id(self._config_entry, None)
             self._last_info = resp
             self._bathfill_target_temp = temp
             self._log_action(
@@ -1645,56 +1907,73 @@ class RheemEziSETApi:
             raise ConditionErrorMessage(type="invalid_flow", message=f"{DOMAIN} - Heater is in use (flow > 0).")
         if mode_val not in (5, None):
             raise ConditionErrorMessage(type="invalid_mode", message=f"{DOMAIN} - Heater not idle (mode={mode_val}).")
+        # OPTIMIZATION: After bath fill exit, sTimeout may still be active briefly (device-side timeout clearing)
+        # Allow bath fill start if we own the session (even if sTimeout is active) - this prevents blocking
+        # when temperature restore is still waiting for sTimeout to clear
         if s_timeout not in (0, None):
-            raise ConditionErrorMessage(type="invalid_sTimeout", message=f"{DOMAIN} - Another controller holds session.")
+            # Check if we own the session - if so, we can proceed (session will be cleared by bath fill start)
+            if self._owned_sid and to_int(data.get("sid")) == self._owned_sid:
+                LOGGER.debug("%s - sTimeout active but we own session (%s), allowing bath fill start", DOMAIN, self._owned_sid)
+            else:
+                raise ConditionErrorMessage(type="invalid_sTimeout", message=f"{DOMAIN} - Another controller holds session.")
 
         # Ensure a sufficiently long session timer so bath fill doesn't time out
         # before the user opens/closes the tap.
+        # OPTIMIZATION: Only set session timer if device doesn't already have sufficient timer.
+        # The bath fill command will create its own session, so we don't need to wait for
+        # the previous session to be released.
         desired_session_timer = max(600, int(self._control_session_timer or 0))
         if session_timer in (None, 0) or session_timer < desired_session_timer:
-            self._log_action(
-                "set_session_timer",
-                "enqueue",
-                control_seq_id="bathfill_start",
-                extra={"session_timer": desired_session_timer, "reason": "bathfill_default"},
-            )
-            try:
-                await self._async_set_param(
-                    param=f"setSessionTimer={desired_session_timer}",
-                    response_param="sessionTimer",
-                    response_check=desired_session_timer,
-                    control_seq_id="bathfill_start",
-                )
-                self._control_session_timer = desired_session_timer
-            except Exception as err:
+            # Only set session timer if significantly below desired (avoid unnecessary delay)
+            # If device has >= 500s, it's probably sufficient (bath fill will extend it)
+            if session_timer is None or session_timer < 500:
                 self._log_action(
                     "set_session_timer",
-                    "error",
+                    "enqueue",
                     control_seq_id="bathfill_start",
-                    extra={
-                        "session_timer": desired_session_timer,
-                        "reason": "bathfill_default",
-                        "error": type(err).__name__,
-                        "detail": str(err),
-                    },
+                    extra={"session_timer": desired_session_timer, "current": session_timer, "reason": "bathfill_default"},
                 )
-                raise ConditionErrorMessage(
-                    type="session_timer_set_failed",
-                    message=f"{DOMAIN} - Failed to set Session Timeout to {desired_session_timer}s. Try again, or set 'number.rheem_session_timeout' to {desired_session_timer} and retry.",
-                ) from err
-
-            # Best-effort refresh to ensure session released before starting.
-            for _ in range(3):
-                refreshed = await self._enqueue_request("getInfo.cgi")
-                if refreshed:
-                    self._last_info = refreshed
-                    data = refreshed
-                if to_int((data or {}).get("sTimeout")) in (0, None):
-                    break
-                await asyncio.sleep(self._effective_min_request_gap)
+                try:
+                    await self._async_set_param(
+                        param=f"setSessionTimer={desired_session_timer}",
+                        response_param="sessionTimer",
+                        response_check=desired_session_timer,
+                        control_seq_id="bathfill_start",
+                    )
+                    self._control_session_timer = desired_session_timer
+                    # OPTIMIZATION: Removed unnecessary refresh after session timer setting
+                    # This saves ~1.5-2.5s (MIN_REQUEST_GAP + request time)
+                    # The session was released in _async_set_param's finally block, so sTimeout should be 0
+                    # We can proceed with existing data - the subsequent bath fill start will get fresh state
+                    # Update data to reflect that session was released (sTimeout = 0)
+                    if isinstance(data, dict):
+                        data = {**data, "sTimeout": 0}
+                except Exception as err:
+                    self._log_action(
+                        "set_session_timer",
+                        "error",
+                        control_seq_id="bathfill_start",
+                        extra={
+                            "session_timer": desired_session_timer,
+                            "reason": "bathfill_default",
+                            "error": type(err).__name__,
+                            "detail": str(err),
+                        },
+                    )
+                    raise ConditionErrorMessage(
+                        type="session_timer_set_failed",
+                        message=f"{DOMAIN} - Failed to set Session Timeout to {desired_session_timer}s. Try again, or set 'number.rheem_session_timeout' to {desired_session_timer} and retry.",
+                    ) from err
+            else:
+                LOGGER.debug("%s - Session timer %s is sufficient (>=500s), skipping set", DOMAIN, session_timer)
+        else:
+            LOGGER.debug("%s - Session timer %s already meets desired %s", DOMAIN, session_timer, desired_session_timer)
         current_sid = to_int(data.get("sid"))
         if self._owned_sid and not self._bathfill_active(data) and current_sid in (0, None):
             self._owned_sid = None
+            # Clear from storage
+            if self._config_entry:
+                await self._save_session_id(self._config_entry, None)
         if self._owned_sid and current_sid not in (0, None, self._owned_sid):
             raise HomeAssistantError(f"{DOMAIN} - Another session is active (sid={current_sid}); cannot start a new bath fill.")
 
@@ -1724,13 +2003,27 @@ class RheemEziSETApi:
                         type="bathfill_start_busy",
                         message=f"{DOMAIN} - Failed to start bath fill; will retry when device free (resp={resp})",
                     )
-                try:
-                    self._owned_sid = int(sid)
-                except Exception:
-                    self._owned_sid = None
-                # Capture immediate response and, if possible, a follow-up getInfo to include fillPercent.
+                # Success - save session ID to storage for bath fill sessions (long-running)
+                self._owned_sid = int(sid)
+                # Save to storage for bath fill sessions (long-running)
+                if self._config_entry:
+                    try:
+                        await self._save_session_id(self._config_entry, self._owned_sid)
+                        LOGGER.info("%s - Saved session ID %s for bath fill (entry_id=%s)", DOMAIN, self._owned_sid, self._config_entry.entry_id)
+                    except Exception as err:
+                        LOGGER.error("%s - Failed to save session ID after bath fill start: %s", DOMAIN, err, exc_info=True)
+                        # Don't clear _owned_sid on storage failure - we still have it in memory
+                else:
+                    LOGGER.warning("%s - No config_entry reference; session ID %s not persisted", DOMAIN, self._owned_sid)
+                # Capture immediate response and reset fillPercent to 0.0 for new bath fill
                 self._last_info = resp
+                if isinstance(self._last_info, dict):
+                    self._last_info["fillPercent"] = 0.0
                 self._bathfill_target_temp = temp
+                self._bathfill_target_vol = vol  # Store target volume for fill percent estimation
+                # Initialize fill percent tracking for flow-based estimation
+                self._last_fill_percent = 0.0
+                self._last_fill_percent_timestamp = time.monotonic()
             self._log_action(
                 "bathfill_start",
                 "ok",
@@ -1741,6 +2034,12 @@ class RheemEziSETApi:
                 refreshed = await self._enqueue_request("getInfo.cgi")
                 if refreshed:
                     self._last_info = refreshed
+                    # Ensure fillPercent is 0.0 at start (device may report stale value)
+                    if isinstance(self._last_info, dict):
+                        # Only reset if device hasn't started filling yet (flow=0)
+                        flow_val = to_float(self._last_info.get("flow"))
+                        if flow_val in (0, None):
+                            self._last_info["fillPercent"] = 0.0
             except Exception:
                 # Best-effort; continue even if refresh fails.
                 pass
@@ -1768,69 +2067,168 @@ class RheemEziSETApi:
                 f"{DOMAIN} - Device lockout suspected; backing off until {self._lockout_until_monotonic}"
             )
 
+        # Try to restore session ID from storage first (in case we restarted)
+        if not self._owned_sid and self._config_entry:
+            try:
+                restored_sid = await self._restore_session_id(self._config_entry)
+                if restored_sid:
+                    LOGGER.info("%s - Restored session ID %s from storage before cancel check", DOMAIN, restored_sid)
+            except Exception as err:
+                LOGGER.debug("%s - Failed to restore session ID before cancel: %s", DOMAIN, err)
+        
         info = await self._enqueue_request("getInfo.cgi")
         self._last_info = info
 
-        # Poll flow every 30 seconds until tap is closed (flow = 0)
-        # This matches Rheem mobile app behavior - it detects tap closure quickly
-        flow_val = to_float(info.get("flow"))
-        max_wait_s = 3600  # Maximum 1 hour wait
-        poll_interval_s = 30.0  # Check every 30 seconds
-        start_time = time.monotonic()
-
-        while flow_val not in (0, None):
-            elapsed = time.monotonic() - start_time
-            if elapsed >= max_wait_s:
-                raise ConditionErrorMessage(
-                    type="flow_active_timeout",
-                    message=f"{DOMAIN} - Flow still active after {max_wait_s}s; cannot cancel bath fill until tap is closed (flow={flow_val} L/min).",
-                )
-
-            # Wait 30 seconds before next check
-            await asyncio.sleep(poll_interval_s)
-
-            # Get fresh device state to check flow
-            info = await self._enqueue_request("getInfo.cgi", control_seq_id="bathfill_exit_flow_check")
-            self._last_info = info
-            flow_val = to_float(info.get("flow"))
-
-            # Log progress
-            self._log_action(
-                "bathfill_cancel",
-                "waiting_for_flow",
-                control_seq_id="bathfill_exit",
-                extra={"flow": flow_val, "elapsed_s": int(elapsed)},
-            )
-
+        # Check if device is actually in bath fill mode (mode 20, 25, 30, or 35)
+        # This is the authoritative check - if device is in bath fill mode, we MUST send cancel
+        device_active = self._bathfill_active(info)
         engaged = self._bathfill_engaged(info)
-        if not engaged:
+
+        # If device is NOT in bath fill mode, only clear latches if needed and return early
+        if not device_active:
+            # Device is not in bath fill mode - only clear latches if they were set
+            if not engaged:
+                # Clear latches if they were set (e.g., start was in progress but device didn't confirm)
+                if self._bathfill_latched or self._completion_latched:
+                    self._bathfill_latched = False
+                    self._completion_latched = False
+                    self._ignore_completion_state = True
+                    self._bathfill_target_temp = None
+                    self._bathfill_target_vol = None
+                    self._last_fill_percent = None
+                    self._last_fill_percent_timestamp = 0.0
+                    self._owned_sid = None
+                # Clear from storage
+                if self._config_entry:
+                    await self._save_session_id(self._config_entry, None)
+                    self._cancel_user_settemp = False
+                    # Log that we cleared latches without device cancellation
+                    self._log_action(
+                        "bathfill_cancel",
+                        "cleared_latches_only",
+                        control_seq_id="bathfill_exit",
+                        extra={"origin": origin or "user", "entity_id": entity_id, "reason": "not_active"},
+                    )
             return
 
+        # Device IS in bath fill mode - we MUST send cancel command
+        # At completion (mode 35), flow should already be 0, so skip flow check
+        mode_val = to_int(info.get("mode"))
+        is_completion = mode_val == 35
+        flow_val = to_float(info.get("flow"))
+        
+        # Only wait for flow if not in completion mode (completion implies flow is already 0)
+        if not is_completion:
+            # OPTIMIZATION: Reduce flow check interval from 30s to 5s for faster exit
+            # AGENTS.md findings: 1.0s polling is optimal, but flow checks can be less frequent
+            # Using 5s provides good balance between responsiveness and device load
+            max_wait_s = 3600  # Maximum 1 hour wait
+            poll_interval_s = 5.0  # Reduced from 30.0s - check every 5 seconds for faster exit
+            start_time = time.monotonic()
+
+            while flow_val not in (0, None):
+                elapsed = time.monotonic() - start_time
+                if elapsed >= max_wait_s:
+                    raise ConditionErrorMessage(
+                        type="flow_active_timeout",
+                        message=f"{DOMAIN} - Flow still active after {max_wait_s}s; cannot cancel bath fill until tap is closed (flow={flow_val} L/min).",
+                    )
+
+                # Wait 5 seconds before next check (reduced from 30s for faster exit)
+                await asyncio.sleep(poll_interval_s)
+
+                # Get fresh device state to check flow
+                info = await self._enqueue_request("getInfo.cgi", control_seq_id="bathfill_exit_flow_check")
+                self._last_info = info
+                flow_val = to_float(info.get("flow"))
+
+                # Re-check if device is still active (might have exited while waiting)
+                device_active = self._bathfill_active(info)
+                if not device_active:
+                    # Device exited bath fill mode while waiting for flow - just clear latches and return
+                    if self._bathfill_latched or self._completion_latched:
+                        self._bathfill_latched = False
+                        self._completion_latched = False
+                        self._ignore_completion_state = True
+                        self._bathfill_target_temp = None
+                        self._bathfill_target_vol = None
+                        self._last_fill_percent = None
+                        self._last_fill_percent_timestamp = 0.0
+                        self._owned_sid = None
+                    # Clear from storage
+                    if self._config_entry:
+                        await self._save_session_id(self._config_entry, None)
+                        self._cancel_user_settemp = False
+                    return
+
+                # Log progress (only if still waiting)
+                self._log_action(
+                    "bathfill_cancel",
+                    "waiting_for_flow",
+                    control_seq_id="bathfill_exit",
+                    extra={"flow": flow_val, "elapsed_s": int(elapsed)},
+                )
+        else:
+            LOGGER.info("%s - At completion (mode 35), skipping flow check - proceeding to exit", DOMAIN)
+
+        # First, try to use saved session ID from storage (we should have it if we started the bath fill)
         sid = self._owned_sid
+        if not sid:
+            # Try to restore from storage if we don't have it in memory
+            if self._config_entry:
+                try:
+                    restored_sid = await self._restore_session_id(self._config_entry)
+                    if restored_sid:
+                        sid = restored_sid
+                        LOGGER.info("%s - Restored session ID %s from storage for bath fill exit", DOMAIN, sid)
+                except Exception as err:
+                    LOGGER.debug("%s - Failed to restore session ID from storage: %s", DOMAIN, err)
+        
+        # If still no session ID, try to get it from device state
         if not sid:
             sid = to_int(info.get("sid"))
             if sid == 0:
                 sid = None
 
         if not sid:
+            # Try to reacquire session and cancel, even if sTimeout is active
+            # Some firmware allows bathfillCtrl=0 without session ID
+            # At completion (mode 35), allow exit even if sTimeout is active (device is waiting for exit)
+            # Use the earlier is_completion check (from line 2037) to avoid re-checking mode
             s_timeout = to_int(info.get("sTimeout"))
-            if s_timeout not in (0, None):
-                raise ConditionErrorMessage(
-                    type="invalid_sTimeout",
-                    message=f"{DOMAIN} - Cannot cancel bath fill: another controller holds session (sTimeout={s_timeout}).",
-                )
+            
             try:
+                # Try exit command with sid=0 first (some firmware allows this)
                 reacquire = await self._enqueue_request("ctrl.cgi?sid=0&bathfillCtrl=0", control_seq_id="bathfill_exit_reacquire")
+                reacquire_sid = to_int(reacquire.get("sid"))
+                if reacquire_sid and reacquire_sid != 0:
+                    sid = reacquire_sid
+                    self._owned_sid = sid
+                    # Save the reacquired session ID
+                    if self._config_entry:
+                        await self._save_session_id(self._config_entry, sid)
+                    LOGGER.info("%s - Reacquired session ID %s for bath fill exit", DOMAIN, sid)
+                else:
+                    # No session ID returned, but command might have succeeded
+                    # At completion, allow proceeding with sid=0
+                    sid = 0
+                    if is_completion:
+                        LOGGER.info("%s - At completion (mode 35), proceeding with sid=0 for exit", DOMAIN)
             except Exception as err:
-                raise ConditionErrorMessage(
-                    type="invalid_session_id",
-                    message=f"{DOMAIN} - Cannot cancel bath fill yet (sid missing); will retry.",
-                ) from err
-            # Some firmware returns sid=0 for this "no-sid" cancel path; treat as best-effort
-            # and confirm via getInfo after sending the command.
-            sid = to_int(reacquire.get("sid"))
-            if sid in (None, 0):
-                sid = 0
+                # Reacquisition failed - at completion, allow exit even if sTimeout is active
+                if is_completion:
+                    LOGGER.warning("%s - Reacquisition failed at completion, but allowing exit with sid=0 (sTimeout=%s)", DOMAIN, s_timeout)
+                    sid = 0
+                elif s_timeout not in (0, None):
+                    raise ConditionErrorMessage(
+                        type="invalid_sTimeout",
+                        message=f"{DOMAIN} - Cannot cancel bath fill: another controller holds session (sTimeout={s_timeout}).",
+                    )
+                else:
+                    raise ConditionErrorMessage(
+                        type="invalid_session_id",
+                        message=f"{DOMAIN} - Cannot cancel bath fill yet (sid missing); will retry.",
+                    ) from err
 
         self._log_action(
             "bathfill_cancel",
@@ -1840,35 +2238,73 @@ class RheemEziSETApi:
         )
         try:
             async with self._write_lock:
-                await self._enqueue_request(f"ctrl.cgi?sid={sid}&bathfillCtrl=0", control_seq_id="bathfill_exit")
-                self._owned_sid = None
+                exit_resp = await self._enqueue_request(f"ctrl.cgi?sid={sid}&bathfillCtrl=0", control_seq_id="bathfill_exit")
+                # Check if exit command response indicates success
+                # Some firmware may return bathfillCtrl=0 in response to confirm exit
+                exit_confirmed = exit_resp.get("bathfillCtrl") in (0, None, False) or not is_one(exit_resp.get("bathfillCtrl"))
+                if not exit_confirmed:
+                    LOGGER.warning("%s - Exit command response unexpected: %s", DOMAIN, exit_resp)
                 self._cancel_user_settemp = False
+            # OPTIMIZATION: Reduce exit confirmation delay - exit commands are simpler than temp changes
+            # AGENTS.md findings: device needs ~1.0s for temp changes, but exit commands are faster
+            # Use minimal delay (0.2s) - just enough for device to process, then poll immediately
+            await asyncio.sleep(0.2)
             # Single confirmation poll; if still active, retry later.
             safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info")
             self._last_info = safe_info
             if self._bathfill_active(safe_info):
+                # Device still active - don't clear session ID yet, we may need it for retry
                 raise ConditionErrorMessage(
                     type="bathfill_exit_retry",
                     message=f"{DOMAIN} - Bath fill still active after cancel; will retry.",
                 )
+            # Exit successful - now clear session ID and storage
+            self._owned_sid = None
+            if self._config_entry:
+                await self._save_session_id(self._config_entry, None)
             self._bathfill_latched = False
             self._completion_latched = False
             self._ignore_completion_state = True
             self._bathfill_target_temp = None
+            self._bathfill_target_vol = None
+            self._last_fill_percent = None
+            self._last_fill_percent_timestamp = 0.0
 
+            # Restore previous temperature if one was saved before bath fill started
+            # OPTIMIZATION: Check sTimeout before attempting restore - if device still has active session,
+            # skip restore to avoid blocking. The device will clear sTimeout naturally, and we can restore later.
             if self._pending_restore_temp is not None:
                 mode_val = to_int(safe_info.get("mode"))
                 flow_val = to_float(safe_info.get("flow"))
-                if mode_val in (5, None) and flow_val in (0, None):
-                    await self.async_set_temp(
-                        water_heater=None,
-                        temp=self._pending_restore_temp,
-                        allow_bathfill_override=True,
-                        control_seq_id="bathfill_restore",
-                        origin="system",
-                        entity_id=entity_id,
-                    )
+                s_timeout_val = to_int(safe_info.get("sTimeout"))
+                
+                # Only attempt restore if device is idle AND no active session timeout
+                # This prevents blocking on sTimeout which can take time to clear after exit
+                if mode_val in (5, None) and flow_val in (0, None) and s_timeout_val in (0, None):
+                    # Clear pending flag BEFORE calling async_set_temp to prevent duplicate restores
+                    # if async_get_data runs concurrently
+                    restore_temp = self._pending_restore_temp
                     self._pending_restore_temp = None
+                    try:
+                        await self.async_set_temp(
+                            water_heater=None,
+                            temp=restore_temp,
+                            allow_bathfill_override=True,
+                            control_seq_id="bathfill_restore",
+                            origin="system",
+                            entity_id=entity_id,
+                        )
+                        LOGGER.info("%s - Restored temperature to %d°C after bath fill exit", DOMAIN, restore_temp)
+                    except Exception as restore_err:
+                        LOGGER.warning("%s - Failed to restore temperature after bath fill exit: %s", DOMAIN, restore_err)
+                        # Don't re-set _pending_restore_temp on error - user can manually set temperature if needed
+                else:
+                    # Device not ready for restore (sTimeout active or not idle) - skip for now
+                    # Temperature restore will happen later when device is ready (via async_get_data check)
+                    LOGGER.debug(
+                        "%s - Skipping temperature restore after exit: mode=%s, flow=%s, sTimeout=%s (will retry later)",
+                        DOMAIN, mode_val, flow_val, s_timeout_val
+                    )
             self._log_action(
                 "bathfill_cancel",
                 "ok",

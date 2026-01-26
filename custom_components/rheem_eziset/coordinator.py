@@ -69,10 +69,12 @@ class RheemEziSETDataUpdateCoordinator(DataUpdateCoordinator):
 
         async def _run() -> None:
             start = time.monotonic()
-            settle_window = 10.0  # Reduced from 20s (sufficient for state to settle)
+            base_settle_window = 7.0  # Optimized from 8s - still sufficient for state to settle, improves responsiveness
             max_iters = 20  # Increased from 12 (allows more frequent polling during active operations)
             iters = 0
             try:
+                # OPTIMIZATION: Start first poll immediately if rate limit allows, don't wait for initial delay
+                # This provides faster initial feedback after control operations
                 while True:
                     iters += 1
                     now = time.monotonic()
@@ -80,19 +82,46 @@ class RheemEziSETDataUpdateCoordinator(DataUpdateCoordinator):
                     poll_backoff = getattr(self.api, "_poll_backoff_until", 0.0) or 0.0
                     target = max(next_allowed, poll_backoff, now)
                     delay = max(0.0, target - now)
-                    if delay:
+                    # Only wait if delay is significant (>0.1s) - small delays can be ignored for faster updates
+                    if delay > 0.1:
                         await asyncio.sleep(delay)
 
                     try:
                         data = await self.api.async_get_info_only()
-                        # Only update if data actually changed to avoid unnecessary entity updates
+                        # OPTIMIZATION: Only compare key fields instead of entire dict for efficiency
+                        # This avoids expensive deep dict comparisons while still detecting meaningful changes
                         current_data = self.data
-                        if current_data != data:
-                            self.async_set_updated_data(data)
+                        if current_data:
+                            # Check if critical fields changed (more efficient than full dict comparison)
+                            # Only check fields that are present in at least one dict to avoid false positives
+                            key_fields = ("temp", "reqtemp", "setTemp", "mode", "state", "flow", "fillPercent", "bathfillCtrl", "sTimeout", "sid")
+                            data_changed = False
+                            for key in key_fields:
+                                old_val = current_data.get(key)
+                                new_val = data.get(key)
+                                # Only compare if at least one value exists (avoids None != None false positives)
+                                if old_val is not None or new_val is not None:
+                                    if old_val != new_val:
+                                        data_changed = True
+                                        break
+                            
+                            if data_changed:
+                                self.async_set_updated_data(data)
+                            else:
+                                LOGGER.debug("%s debug fast_refresh: key fields unchanged, skipping update", DOMAIN)
                         else:
-                            LOGGER.debug("%s debug fast_refresh: data unchanged, skipping update", DOMAIN)
+                            # No current data, always update
+                            self.async_set_updated_data(data)
+                        
+                        # OPTIMIZATION: If bath fill is active, extend settle window for more frequent updates
+                        # This ensures fill percent updates are more responsive during active bath fill
+                        bathfill_active = bool(self.api._bathfill_active(data) if hasattr(self.api, "_bathfill_active") else False)
+                        # Use extended settle window (30s) while bath fill is active for more frequent updates
+                        settle_window = 30.0 if bathfill_active else base_settle_window
                     except Exception as err:  # pylint: disable=broad-except
                         LOGGER.debug("%s debug fast_refresh iteration failed (%s): %s", DOMAIN, type(err).__name__, err)
+                        # On error, use base settle window
+                        settle_window = base_settle_window
 
                     pending = bool(getattr(self.api, "_pending_writes", {}))
                     within_settle = (time.monotonic() - start) < settle_window
