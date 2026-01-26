@@ -2080,36 +2080,56 @@ class RheemEziSETApi:
         self._last_info = info
 
         # Check if device is actually in bath fill mode (mode 20, 25, 30, or 35)
-        # This is the authoritative check - if device is in bath fill mode, we MUST send cancel
+        # Also check if bath fill is engaged (includes latches) - this catches cases where
+        # device is in an unrecognized mode but we know bath fill is active
         device_active = self._bathfill_active(info)
         engaged = self._bathfill_engaged(info)
 
-        # If device is NOT in bath fill mode, only clear latches if needed and return early
-        if not device_active:
-            # Device is not in bath fill mode - only clear latches if they were set
-            if not engaged:
-                # Clear latches if they were set (e.g., start was in progress but device didn't confirm)
-                if self._bathfill_latched or self._completion_latched:
-                    self._bathfill_latched = False
-                    self._completion_latched = False
-                    self._ignore_completion_state = True
-                    self._bathfill_target_temp = None
-                    self._bathfill_target_vol = None
-                    self._last_fill_percent = None
-                    self._last_fill_percent_timestamp = 0.0
-                    self._owned_sid = None
-                # Clear from storage
-                if self._config_entry:
-                    await self._save_session_id(self._config_entry, None)
-                    self._cancel_user_settemp = False
-                    # Log that we cleared latches without device cancellation
-                    self._log_action(
-                        "bathfill_cancel",
-                        "cleared_latches_only",
-                        control_seq_id="bathfill_exit",
-                        extra={"origin": origin or "user", "entity_id": entity_id, "reason": "not_active"},
-                    )
+        # If device is NOT in bath fill mode AND not engaged (no latches), only clear latches if needed and return early
+        # IMPORTANT: If engaged is True (latches set), we should still try to send exit command
+        # because the device might be in an unrecognized mode (e.g., mode 99) but still in bath fill
+        if not device_active and not engaged:
+            # Device is not in bath fill mode and not engaged - only clear latches if they were set
+            if self._bathfill_latched or self._completion_latched:
+                self._bathfill_latched = False
+                self._completion_latched = False
+                self._ignore_completion_state = True
+                self._bathfill_target_temp = None
+                self._bathfill_target_vol = None
+                self._last_fill_percent = None
+                self._last_fill_percent_timestamp = 0.0
+                self._owned_sid = None
+            # Clear from storage
+            if self._config_entry:
+                await self._save_session_id(self._config_entry, None)
+                self._cancel_user_settemp = False
+                # Log that we cleared latches without device cancellation
+                self._log_action(
+                    "bathfill_cancel",
+                    "cleared_latches_only",
+                    control_seq_id="bathfill_exit",
+                    extra={"origin": origin or "user", "entity_id": entity_id, "reason": "not_active"},
+                )
             return
+        
+        # If engaged but not device_active, log a warning and proceed with exit attempt
+        # This handles cases where device is in an unrecognized mode but latches indicate bath fill is active
+        # Also check bathfillCtrl directly - if it's 1, we know bath fill is active regardless of mode
+        bathfill_ctrl = info.get("bathfillCtrl")
+        if engaged and not device_active:
+            mode_val = to_int(info.get("mode"))
+            LOGGER.warning(
+                "%s - Bath fill engaged (latches set) but device mode (%s) not recognized as bath fill. "
+                "bathfillCtrl=%s. Attempting exit command anyway.",
+                DOMAIN, mode_val, bathfill_ctrl
+            )
+        elif is_one(bathfill_ctrl) and not device_active:
+            # bathfillCtrl=1 but mode not recognized - still try to exit
+            mode_val = to_int(info.get("mode"))
+            LOGGER.warning(
+                "%s - bathfillCtrl=1 but device mode (%s) not recognized as bath fill. Attempting exit command.",
+                DOMAIN, mode_val
+            )
 
         # Device IS in bath fill mode - we MUST send cancel command
         # At completion (mode 35), flow should already be 0, so skip flow check
@@ -2241,8 +2261,9 @@ class RheemEziSETApi:
                 exit_resp = await self._enqueue_request(f"ctrl.cgi?sid={sid}&bathfillCtrl=0", control_seq_id="bathfill_exit")
                 # Check if exit command response indicates success
                 # Some firmware may return bathfillCtrl=0 in response to confirm exit
-                exit_confirmed = exit_resp.get("bathfillCtrl") in (0, None, False) or not is_one(exit_resp.get("bathfillCtrl"))
-                if not exit_confirmed:
+                exit_resp_bathfill_ctrl = exit_resp.get("bathfillCtrl")
+                exit_confirmed_in_resp = exit_resp_bathfill_ctrl in (0, None, False) or not is_one(exit_resp_bathfill_ctrl)
+                if not exit_confirmed_in_resp:
                     LOGGER.warning("%s - Exit command response unexpected: %s", DOMAIN, exit_resp)
                 self._cancel_user_settemp = False
             # OPTIMIZATION: Reduce exit confirmation delay - exit commands are simpler than temp changes
@@ -2252,8 +2273,25 @@ class RheemEziSETApi:
             # Single confirmation poll; if still active, retry later.
             safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info")
             self._last_info = safe_info
-            if self._bathfill_active(safe_info):
-                # Device still active - don't clear session ID yet, we may need it for retry
+            
+            # Check if exit was successful by looking at bathfillCtrl in the response
+            # If bathfillCtrl is 0 (or not 1), the exit command was accepted even if mode is still 35
+            # The device may report mode 35 (completion) briefly after exit, but bathfillCtrl=0 confirms exit
+            safe_bathfill_ctrl = safe_info.get("bathfillCtrl")
+            safe_mode = to_int(safe_info.get("mode"))
+            exit_confirmed_in_poll = safe_bathfill_ctrl in (0, None, False) or not is_one(safe_bathfill_ctrl)
+            
+            # Exit is successful if bathfillCtrl is 0 (or not 1) - this is the authoritative indicator
+            # Mode 35 may persist briefly, but bathfillCtrl=0 means the device accepted the exit
+            if exit_confirmed_in_poll:
+                # Exit successful - device accepted the exit command (bathfillCtrl is 0)
+                LOGGER.info("%s - Bath fill exit confirmed: bathfillCtrl=%s, mode=%s", DOMAIN, safe_bathfill_ctrl, safe_mode)
+            elif safe_mode not in (20, 25, 30, 35):
+                # Device is not in bath fill mode - exit successful
+                LOGGER.info("%s - Bath fill exit confirmed: device not in bath fill mode (mode=%s)", DOMAIN, safe_mode)
+            else:
+                # Device still active (bathfillCtrl=1 and mode in bath fill modes) - retry needed
+                LOGGER.warning("%s - Bath fill still active after cancel: bathfillCtrl=%s, mode=%s", DOMAIN, safe_bathfill_ctrl, safe_mode)
                 raise ConditionErrorMessage(
                     type="bathfill_exit_retry",
                     message=f"{DOMAIN} - Bath fill still active after cancel; will retry.",
