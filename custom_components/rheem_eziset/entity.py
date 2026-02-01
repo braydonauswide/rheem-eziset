@@ -60,3 +60,6 @@ class RheemEziSETEntity(CoordinatorEntity):
     def should_poll(self) -> bool:
         """Device should not poll because this is handled by async requests in the api."""
         return False
+
+ 
+ 
