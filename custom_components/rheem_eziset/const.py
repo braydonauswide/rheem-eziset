@@ -33,6 +33,9 @@ DEFAULT_BATHFILL_PRESETS: dict[int, dict[str, object]] = {
     2: {"enabled": True, "name": "Adults", "temp": 43, "vol": 140},
 }
 
+# Bath fill modes: device reports these when bath fill is active (15 = heating/delivering; 20/25/30 = filling; 35 = complete).
+BATHFILL_MODES = (15, 20, 25, 30, 35)
+
 # Mode Dictionary
 CONST_MODE_MAP = {
     5: ("Idle", "mdi:water-boiler-auto"),

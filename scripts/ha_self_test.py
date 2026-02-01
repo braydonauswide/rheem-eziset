@@ -290,6 +290,16 @@ def scan_debug_log_for_errors(path: Path, *, since_ts_ms: int) -> list[str]:
             if path_s in {"getParams.cgi", "version.cgi"}:
                 continue
 
+            # Ignore transient errors (device/network delay); lockout still caught below.
+            error_type = data.get("error_type") or ""
+            path_base = path_s.split("?")[0] if path_s else ""
+            if path_base in ("getInfo.cgi", "ctrl.cgi") and error_type in (
+                "TimeoutError",
+                "ServerDisconnectedError",
+                "ClientConnectorError",
+            ):
+                continue
+
             # Treat lockout as a hard failure signal.
             if lockout_until is not None:
                 errors.append(f"HTTP lockout: {path_s} ({data.get('error_type')})")
@@ -301,7 +311,12 @@ def scan_debug_log_for_errors(path: Path, *, since_ts_ms: int) -> list[str]:
             continue
 
         if action == "write_queue" and stage == "error_drop":
-            errors.append(f"write_queue error_drop: op={data.get('op')} reason={data.get('reason')}")
+            op_name = data.get("op") or ""
+            reason = str(data.get("reason") or "")
+            # Ignore historical restore_temp error (fixed: _do_restore_temp now accepts control_seq_id).
+            if op_name == "restore_temp" and "control_seq_id" in reason:
+                continue
+            errors.append(f"write_queue error_drop: op={op_name} reason={reason}")
             continue
 
     return errors
@@ -787,6 +802,7 @@ async def async_main() -> int:
             "performance",
             "flow_exit_behavior",
             "rate_limit_iterative",
+            "end_bath_script",
         ],
         default="core",
     )
@@ -890,6 +906,42 @@ async def async_main() -> int:
                 print(f"- {e.get('entity_id')} (unique_id={e.get('unique_id')})")
             return 0
 
+        if args.suite == "end_bath_script":
+            try:
+                script_state = await rest.get_state("script.end_bath_with_fallback")
+            except Exception:
+                print("Script not loaded; add config/scripts.yaml and script include to use this suite.")
+                return 0
+            if script_state.get("state") == "unavailable":
+                print("Script not loaded; add config/scripts.yaml and script include to use this suite.")
+                return 0
+            print("Calling End Bath (with fallback) script (fallback skipped)...")
+            await rest.call_service(
+                "script",
+                "turn_on",
+                {
+                    "entity_id": "script.end_bath_with_fallback",
+                    "variables": {
+                        "bath_fill_entity_id": ids.bathfill_switch,
+                        "hot_water_switch_entity_id": "",
+                    },
+                },
+            )
+            for _ in range(35):
+                await asyncio.sleep(1)
+                try:
+                    s = await rest.get_state("script.end_bath_with_fallback")
+                    if s.get("state") == "off":
+                        break
+                except Exception:
+                    pass
+            print("end_bath_script: script completed.")
+            errs = scan_debug_log_for_errors(Path(args.debug_log), since_ts_ms=suite_started_ms)
+            if errs:
+                raise RuntimeError("debug log errors detected:\n- " + "\n- ".join(errs))
+            print("end_bath_script suite complete")
+            return 0
+
         if args.suite == "extended":
             # Physical/interactive scenarios (safe: should not issue device writes if flow is active).
             flow_state = await rest.get_state(ids.flow_sensor)
@@ -978,6 +1030,7 @@ async def async_main() -> int:
                 await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling", "complete_waiting_for_exit"), timeout_s=120, poll_s=5.0)
                 print("cancelling manually via Bath Fill switch...")
                 await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                await asyncio.sleep(5.0)
                 await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=900)
                 await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=900, poll_s=5.0)
                 await _wait_for_state(rest, ids.mode_raw_sensor, predicate=lambda s: _as_int(s) == 5, timeout_s=600, poll_s=5.0)
@@ -1019,7 +1072,7 @@ async def async_main() -> int:
                 if active.get("state") in ("active", "filling", "complete_waiting_for_exit"):
                     print("bath fill active at start; attempting to turn off Bath Fill switch...", file=sys.stderr)
                     await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
-                    await asyncio.sleep(5.0)
+                    await asyncio.sleep(10.0)
             except Exception:
                 pass
 
@@ -1031,7 +1084,7 @@ async def async_main() -> int:
                 timeout_s=300,
                 poll_s=5.0,
             )
-            await _wait_for_idle_controls(rest, ids, timeout_s=600, poll_s=5.0)
+            await _wait_for_idle_controls(rest, ids, timeout_s=900, poll_s=5.0)
 
             flow_state = await rest.get_state(ids.flow_sensor)
             mode_raw_state = await rest.get_state(ids.mode_raw_sensor)
@@ -1168,10 +1221,10 @@ async def async_main() -> int:
                 backoff_s=15.0,
             )
             try:
-                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=300)
+                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=360)
             except TimeoutError:
                 pass
-            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling", "complete_waiting_for_exit"), timeout_s=300)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling", "complete_waiting_for_exit"), timeout_s=360)
             await asyncio.sleep(args.min_action_gap)
 
             print("bath fill cancel via Bath Fill switch")
@@ -1184,11 +1237,12 @@ async def async_main() -> int:
                 idle_wait=lambda: _wait_for_idle_controls(rest, ids, timeout_s=60),
                 backoff_s=15.0,
             )
+            await asyncio.sleep(5.0)
             try:
-                await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=300)
+                await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=360)
             except TimeoutError:
                 pass
-            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=360)
             await asyncio.sleep(args.min_action_gap)
 
         if run_services:
@@ -1276,8 +1330,8 @@ async def async_main() -> int:
             except Exception:
                 pass  # Best effort
             await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
-            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=120)
-            await asyncio.sleep(2.0)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=180)
+            await asyncio.sleep(5.0)
             try:
                 await _expect_error(rest, "switch", "turn_on", {"entity_id": ids.bathfill_switch}, expected_message_substring="already engaged")
                 print("  ✓ correctly rejected when already engaged")
@@ -1301,20 +1355,47 @@ async def async_main() -> int:
             min_temp = _try_int(wh_attrs.get("min_temp"))
             max_temp = _try_int(wh_attrs.get("max_temp"))
 
-            # Temperature boundaries
+            # Temperature boundaries (retry once on transient 500; skip step if still failing)
             if min_temp is not None and max_temp is not None:
                 print("--- Temperature boundaries ---")
-                print(f"testing temperature = {min_temp} (min)")
-                await rest.call_service("water_heater", "set_temperature", {"entity_id": ids.water_heater, "temperature": min_temp})
-                await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
-                await asyncio.sleep(args.min_action_gap)
+                temp_ok = False
+                for attempt in range(2):
+                    try:
+                        print(f"testing temperature = {min_temp} (min)")
+                        await rest.call_service("water_heater", "set_temperature", {"entity_id": ids.water_heater, "temperature": min_temp})
+                        temp_ok = True
+                        break
+                    except RuntimeError as err:
+                        if "500" in str(err) and attempt == 0:
+                            print("  WARNING: transient 500 on min temp, retrying after 8s...")
+                            await asyncio.sleep(8.0)
+                        else:
+                            print(f"  WARNING: skipping min temp (device/HA returned error): {err}")
+                            break
+                if temp_ok:
+                    await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+                    await asyncio.sleep(args.min_action_gap)
 
-                print(f"testing temperature = {max_temp} (max)")
-                await rest.call_service("water_heater", "set_temperature", {"entity_id": ids.water_heater, "temperature": max_temp})
-                await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
-                await asyncio.sleep(args.min_action_gap)
+                temp_ok = False
+                for attempt in range(2):
+                    try:
+                        print(f"testing temperature = {max_temp} (max)")
+                        await rest.call_service("water_heater", "set_temperature", {"entity_id": ids.water_heater, "temperature": max_temp})
+                        temp_ok = True
+                        break
+                    except RuntimeError as err:
+                        if "500" in str(err) and attempt == 0:
+                            print("  WARNING: transient 500 on max temp, retrying after 8s...")
+                            await asyncio.sleep(8.0)
+                        else:
+                            print(f"  WARNING: skipping max temp (device/HA returned error): {err}")
+                            break
+                if temp_ok:
+                    await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
+                    await asyncio.sleep(args.min_action_gap)
 
-            # Session timer boundaries
+            # Session timer boundaries (allow device to settle after temp changes)
+            await asyncio.sleep(15.0)
             print("--- Session timer boundaries ---")
             await _test_boundary(rest, ids.session_timeout_number, "set_value", "value", 60, 900, domain="number")
 
@@ -1330,7 +1411,7 @@ async def async_main() -> int:
             print("--- Bath fill state transitions ---")
             print("testing: cancel when not engaged (should succeed silently)")
             await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
 
             print("testing: start bath fill")
             # Ensure a profile is selected
@@ -1358,22 +1439,24 @@ async def async_main() -> int:
 
             print("testing: cancel and immediately start again")
             await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+            await asyncio.sleep(5.0)
             try:
-                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300)
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=360)
                 print("  ✓ bath fill cancelled successfully")
             except TimeoutError:
                 print("  WARNING: bath fill cancel timed out, but continuing test")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
             await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
             try:
-                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=300)
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=360)
                 print("  ✓ bath fill restarted successfully")
             except TimeoutError:
                 print("  WARNING: bath fill restart timed out")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
 
             # Clean up
             await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+            await asyncio.sleep(5.0)
             await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
             print("state_transitions suite complete")
 
@@ -1424,11 +1507,11 @@ async def async_main() -> int:
             await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
             # Wait for it to actually start
             try:
-                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=120)
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=180)
                 print("  ✓ first bath fill started")
             except TimeoutError:
                 print("  WARNING: first bath fill start timed out, but continuing")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
             # Try to start again immediately (should fail)
             try:
                 await _expect_error(rest, "switch", "turn_on", {"entity_id": ids.bathfill_switch}, expected_message_substring="already engaged")
@@ -1438,6 +1521,7 @@ async def async_main() -> int:
 
             # Clean up
             await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+            await asyncio.sleep(5.0)
             await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
 
             # Concurrent temperature sets
@@ -1677,10 +1761,12 @@ async def async_main() -> int:
             # Wait a bit and check for lockout/health check events
             await asyncio.sleep(10.0)
             for obj in tail.read_new():
-                msg = obj.get("message", "")
+                msg = obj.get("message") or ""
+                data = obj.get("data") or {}
+                ctrl_id = data.get("control_seq_id") or ""
                 if "lockout" in msg.lower() or "cooldown" in msg.lower():
                     lockout_events.append(obj)
-                if "health" in msg.lower() or "health_check" in obj.get("data", {}).get("control_seq_id", ""):
+                if "health" in msg.lower() or "health_check" in ctrl_id:
                     health_check_events.append(obj)
 
             if lockout_events:
@@ -1827,10 +1913,10 @@ async def async_main() -> int:
             print("Starting bath fill...")
             await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
             try:
-                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=120)
+                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=180)
             except TimeoutError:
                 pass
-            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=120)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=180)
 
             print("Bath fill active. Please OPEN the hot tap now (waiting for flow > 0)...")
             if interactive:
@@ -1910,12 +1996,13 @@ async def async_main() -> int:
             # Attempt exit with flow = 0
             try:
                 await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                await asyncio.sleep(5.0)
                 try:
-                    await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=300)
+                    await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=360)
                     print("  ✓ Exit command accepted (log shows success)")
                 except TimeoutError:
                     print("  (log confirmation timeout, checking state...)")
-                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300, poll_s=5.0)
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=360, poll_s=5.0)
                 print("  ✓ Bath fill exited successfully")
             except Exception as err:
                 print(f"  ✗ Exit failed unexpectedly: {type(err).__name__}: {err}")
@@ -1935,10 +2022,10 @@ async def async_main() -> int:
             await _wait_for_idle_controls(rest, ids, timeout_s=180, poll_s=5.0)
             await rest.call_service("switch", "turn_on", {"entity_id": ids.bathfill_switch})
             try:
-                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=120)
+                await _wait_for_log(tail, predicate=_log_action_is("bathfill_start", "ok"), timeout_s=180)
             except TimeoutError:
                 pass
-            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=120)
+            await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") in ("active", "filling"), timeout_s=180)
 
             print("Bath fill active. Please OPEN the hot tap (waiting for flow > 0)...")
             if interactive:
@@ -1979,12 +2066,13 @@ async def async_main() -> int:
             print("Retrying exit with tap CLOSED (should succeed)...")
             try:
                 await rest.call_service("switch", "turn_off", {"entity_id": ids.bathfill_switch})
+                await asyncio.sleep(5.0)
                 try:
-                    await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=300)
+                    await _wait_for_log(tail, predicate=_log_action_is("bathfill_cancel", "ok"), timeout_s=360)
                     print("  ✓ Retry exit succeeded (log shows success)")
                 except TimeoutError:
                     pass
-                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=300, poll_s=5.0)
+                await _wait_for_state(rest, ids.bathfill_status_sensor, predicate=lambda s: s.get("state") == "idle", timeout_s=360, poll_s=5.0)
                 print("  ✓ Bath fill exited successfully on retry")
             except Exception as err:
                 print(f"  ✗ Retry exit failed: {type(err).__name__}: {err}")

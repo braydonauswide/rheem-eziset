@@ -25,6 +25,7 @@ coverage.xml
 # Home Assistant configuration
 config/*
 !config/configuration.yaml
+!config/scripts.yaml
 custom_components/rheem_eziset/debug.log
 .ha_token
 
@@ -43,3 +44,4 @@ requirements.txt
 requirements-ha.txt
 CONTRIBUTING.md
 agents.md
+docker-compose.yaml

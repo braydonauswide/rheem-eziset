@@ -20,7 +20,7 @@ from homeassistant.exceptions import ConditionErrorMessage, HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN, LOGGER
+from .const import BATHFILL_MODES, DOMAIN, LOGGER
 from .util import is_one, to_float, to_int
 from .manifest import manifest_version
 
@@ -82,6 +82,9 @@ class RheemEziSETApi:
     REQUEST_TIMEOUT = ClientTimeout(total=25.0)
     LOCKOUT_CONSEC_FAILURES = 3
     COOLDOWN_SCHEDULE_S = [10, 30, 60, 180]
+    # Optional recovery delay after very slow response to reduce back-to-back timeouts
+    SLOW_RESPONSE_MS = 15_000
+    SLOW_RESPONSE_EXTRA_DELAY_S = 3.0
 
     def __init__(self, hass, host: str, *, test_min_request_gap: float | None = None) -> None:
         """Initialise the basic parameters.
@@ -335,6 +338,11 @@ class RheemEziSETApi:
                 if task.done():
                     try:
                         task.result()  # Check for exceptions
+                    except asyncio.CancelledError:
+                        LOGGER.debug(
+                            "%s - Request worker task cancelled (expected on unload)",
+                            DOMAIN,
+                        )
                     except Exception as err:
                         LOGGER.error(
                             "%s - Request worker task failed: %s",
@@ -670,7 +678,20 @@ class RheemEziSETApi:
         elif op == "bathfill_start":
             await self._do_start_bath_fill(**payload)
         elif op == "bathfill_cancel":
-            await self._do_cancel_bath_fill(**payload)
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    await self._do_cancel_bath_fill(**payload)
+                    return
+                except (ConditionErrorMessage, HomeAssistantError) as err:
+                    cause = err.__cause__ if hasattr(err, "__cause__") else None
+                    if cause is None or not isinstance(
+                        cause, (ClientConnectorError, asyncio.TimeoutError, OSError)
+                    ):
+                        raise
+                    if attempt + 1 >= max_attempts:
+                        raise
+                    await asyncio.sleep(4)
         elif op == "restore_temp":
             await self._do_restore_temp(**payload)
         elif op == "bathfill_set_temp":
@@ -906,12 +927,16 @@ class RheemEziSETApi:
             if self._connection_failures > 0:
                 self._connection_failures = 0
                 self._connection_backoff_until = 0.0
+            elapsed_ms_val = int((time.monotonic() - start) * 1000)
+            if elapsed_ms_val >= self.SLOW_RESPONSE_MS:
+                extra = time.monotonic() + self.SLOW_RESPONSE_EXTRA_DELAY_S
+                self._next_request_at = max(self._next_request_at, extra)
             LOGGER.debug(
                 "%s debug ok req=%s path=%s elapsed_ms=%d bytes=%d",
                 DOMAIN,
                 id(self),
                 path,
-                int((time.monotonic() - start) * 1000),
+                elapsed_ms_val,
                 len(text),
             )
             return data if isinstance(data, Mapping) else {}
@@ -1151,11 +1176,17 @@ class RheemEziSETApi:
         elif device_bathfill_active and self._bathfill_target_vol is not None:
             # OPTIMIZATION: Calculate estimated fill percent based on flow rate between polls
             # This provides smooth, real-time progress updates instead of waiting for device updates
+            # We get full update from getInfo.cgi: flow (L/min) and fillPercent. If the device
+            # reports fillPercent=0 during active filling, treat it as "no reliable value" so we
+            # use flow-based estimation; otherwise percentage would stay at 0 and never increase.
             now = time.monotonic()
             time_since_last_update = now - self._last_fill_percent_timestamp if self._last_fill_percent_timestamp > 0 else 0.0
             
-            # If device provided a new fillPercent value, use it and update tracking
-            if fill_percent is not None:
+            # Use device fillPercent only when it indicates real progress (> 0). During active
+            # fill many devices report 0 until completion; accepting 0 would overwrite our
+            # estimate every poll and percentage would never increase.
+            device_fill_reliable = fill_percent is not None and fill_percent > 0
+            if device_fill_reliable:
                 # Device provided actual value - correct our estimate
                 self._last_fill_percent = fill_percent
                 self._last_fill_percent_timestamp = now
@@ -1176,10 +1207,16 @@ class RheemEziSETApi:
                 # Use estimated value for display (smooth UX)
                 merged["fillPercent"] = estimated_fill_percent
                 
-                LOGGER.debug(
-                    "%s - Estimated fill percent: %.2f%% (last: %.2f%%, flow: %.2f L/min, elapsed: %.1fs, vol_added: %.2f L)",
-                    DOMAIN, estimated_fill_percent, self._last_fill_percent, flow_val, time_since_last_update, volume_added_l
-                )
+                if fill_percent is not None and fill_percent == 0:
+                    LOGGER.debug(
+                        "%s - Using flow-based estimate (device fillPercent=0 during fill): %.2f%% (flow: %.2f L/min, elapsed: %.1fs)",
+                        DOMAIN, estimated_fill_percent, flow_val, time_since_last_update,
+                    )
+                else:
+                    LOGGER.debug(
+                        "%s - Estimated fill percent: %.2f%% (last: %.2f%%, flow: %.2f L/min, elapsed: %.1fs, vol_added: %.2f L)",
+                        DOMAIN, estimated_fill_percent, self._last_fill_percent, flow_val, time_since_last_update, volume_added_l
+                    )
             elif self._last_fill_percent is not None:
                 # No flow or no time elapsed - use last known value
                 merged["fillPercent"] = self._last_fill_percent
@@ -1413,7 +1450,7 @@ class RheemEziSETApi:
         data = data or self._last_info or {}
         mode_val = to_int(data.get("mode"))
         bathfill_ctrl = data.get("bathfillCtrl")
-        return bool((mode_val in {20, 25, 30, 35}) or is_one(bathfill_ctrl))
+        return bool((mode_val in BATHFILL_MODES) or is_one(bathfill_ctrl))
 
     def _bathfill_engaged(self, data: Mapping[str, Any] | None = None) -> bool:
         """Return True when bath fill should be considered engaged (including completion until exit)."""
@@ -1606,6 +1643,9 @@ class RheemEziSETApi:
         *,
         temp: int,
         entity_id: str | None,
+        origin: str | None = None,
+        control_seq_id: str | None = None,
+        **kwargs: Any,
     ) -> None:
         """Execute restore temp as its own queued op."""
         # Use system origin and allow override to bypass user lock.
@@ -1997,31 +2037,46 @@ class RheemEziSETApi:
                 resp = await self._enqueue_request(f"ctrl.cgi?sid=0&bathfillCtrl=1&setBathTemp={temp}&setBathVol={vol}")
                 sid_raw = resp.get("sid")
                 sid = to_int(sid_raw)
-                if not sid or not is_one(resp.get("bathfillCtrl")):
-                    LOGGER.error("%s - Failed to start bath fill, response: %s", DOMAIN, resp)
-                    raise ConditionErrorMessage(
-                        type="bathfill_start_busy",
-                        message=f"{DOMAIN} - Failed to start bath fill; will retry when device free (resp={resp})",
-                    )
-                # Success - save session ID to storage for bath fill sessions (long-running)
-                self._owned_sid = int(sid)
-                # Save to storage for bath fill sessions (long-running)
-                if self._config_entry:
-                    try:
-                        await self._save_session_id(self._config_entry, self._owned_sid)
-                        LOGGER.info("%s - Saved session ID %s for bath fill (entry_id=%s)", DOMAIN, self._owned_sid, self._config_entry.entry_id)
-                    except Exception as err:
-                        LOGGER.error("%s - Failed to save session ID after bath fill start: %s", DOMAIN, err, exc_info=True)
-                        # Don't clear _owned_sid on storage failure - we still have it in memory
+                if sid and is_one(resp.get("bathfillCtrl")):
+                    # Clear success: device returned sid and bathfillCtrl
+                    self._owned_sid = int(sid)
+                    if self._config_entry:
+                        try:
+                            await self._save_session_id(self._config_entry, self._owned_sid)
+                            LOGGER.info("%s - Saved session ID %s for bath fill (entry_id=%s)", DOMAIN, self._owned_sid, self._config_entry.entry_id)
+                        except Exception as err:
+                            LOGGER.error("%s - Failed to save session ID after bath fill start: %s", DOMAIN, err, exc_info=True)
+                    else:
+                        LOGGER.warning("%s - No config_entry reference; session ID %s not persisted", DOMAIN, self._owned_sid)
+                    self._last_info = resp
                 else:
-                    LOGGER.warning("%s - No config_entry reference; session ID %s not persisted", DOMAIN, self._owned_sid)
-                # Capture immediate response and reset fillPercent to 0.0 for new bath fill
-                self._last_info = resp
+                    # Minimal response (sid=0, no bathfillCtrl): device may still have accepted; treat as uncertain
+                    LOGGER.info(
+                        "%s - Bath fill start returned minimal response (sid=%s, bathfillCtrl=%s); relying on next poll to confirm",
+                        DOMAIN, sid_raw, resp.get("bathfillCtrl"),
+                    )
+                    try:
+                        info = await self._enqueue_request("getInfo.cgi")
+                        if info and self._bathfill_active(info):
+                            self._last_info = info
+                            sid_from_info = to_int(info.get("sid"))
+                            if sid_from_info:
+                                self._owned_sid = sid_from_info
+                                if self._config_entry:
+                                    try:
+                                        await self._save_session_id(self._config_entry, self._owned_sid)
+                                        LOGGER.info("%s - Confirmed bath fill started via getInfo, sid=%s", DOMAIN, self._owned_sid)
+                                    except Exception as err:
+                                        LOGGER.debug("%s - Failed to save session ID from getInfo: %s", DOMAIN, err)
+                        else:
+                            self._last_info = resp
+                    except Exception:
+                        self._last_info = resp
+                # Common: set fill state and targets (whether clear success or uncertain)
                 if isinstance(self._last_info, dict):
                     self._last_info["fillPercent"] = 0.0
                 self._bathfill_target_temp = temp
                 self._bathfill_target_vol = vol  # Store target volume for fill percent estimation
-                # Initialize fill percent tracking for flow-based estimation
                 self._last_fill_percent = 0.0
                 self._last_fill_percent_timestamp = time.monotonic()
             self._log_action(
@@ -2286,7 +2341,7 @@ class RheemEziSETApi:
             if exit_confirmed_in_poll:
                 # Exit successful - device accepted the exit command (bathfillCtrl is 0)
                 LOGGER.info("%s - Bath fill exit confirmed: bathfillCtrl=%s, mode=%s", DOMAIN, safe_bathfill_ctrl, safe_mode)
-            elif safe_mode not in (20, 25, 30, 35):
+            elif safe_mode not in BATHFILL_MODES:
                 # Device is not in bath fill mode - exit successful
                 LOGGER.info("%s - Bath fill exit confirmed: device not in bath fill mode (mode=%s)", DOMAIN, safe_mode)
             else:
@@ -2350,6 +2405,10 @@ class RheemEziSETApi:
                 extra={"origin": origin or "user", "entity_id": entity_id, "sid": sid, "owned_sid": self._owned_sid, "post": self._snapshot_state()},
             )
         except Exception as err:
+            if isinstance(err, (ClientConnectorError, asyncio.TimeoutError)):
+                LOGGER.error(
+                    "Bath fill cancel failed (device unreachable or timeout). Turn off switch.rheem_hot_water to stop the bath."
+                )
             self._log_action(
                 "bathfill_cancel",
                 "error",

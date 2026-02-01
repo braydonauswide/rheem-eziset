@@ -9,7 +9,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers import entity_registry as er
 from homeassistant.const import UnitOfTime, UnitOfVolume, STATE_UNAVAILABLE, UnitOfTemperature, PERCENTAGE
 
-from .const import ICON_NAME, ICON_RAW, ICON_TAPON, ICON_TAPOFF, ICON_TIMER, ICON_TEMP, ICON_WATERHEATER, CONST_MODE_MAP, CONST_STATUS_MAP, DOMAIN, LOGGER
+from .const import BATHFILL_MODES, ICON_NAME, ICON_RAW, ICON_TAPON, ICON_TAPOFF, ICON_TIMER, ICON_TEMP, ICON_WATERHEATER, CONST_MODE_MAP, CONST_STATUS_MAP, DOMAIN, LOGGER
 from .util import is_one, to_float, to_int
 from .coordinator import RheemEziSETDataUpdateCoordinator
 from .entity import RheemEziSETEntity
@@ -136,7 +136,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
     sensors.extend(
         [
             BathFillStatusSensor(coordinator, entry),
-            QueuedTemperatureChangeSensor(coordinator, entry),
+            QueuedChangeSensor(coordinator, entry),
             BathFillProgressSensor(coordinator, entry),
         ]
     )
@@ -276,25 +276,25 @@ class BathFillStatusSensor(RheemEziSETEntity, SensorEntity):
         return "idle"
 
 
-class QueuedTemperatureChangeSensor(RheemEziSETEntity, SensorEntity):
-    """Expose queued temperature change state."""
+class QueuedChangeSensor(RheemEziSETEntity, SensorEntity):
+    """Expose queued change state (temp, bath fill start/exit, session timer, restore)."""
 
     _attr_has_entity_name = True
-    _attr_name = "Queued Temperature Change"
+    _attr_name = "Queued Change"
 
     def __init__(self, coordinator: RheemEziSETDataUpdateCoordinator, entry: ConfigEntry) -> None:
-        """Initialize the queued temperature change sensor."""
+        """Initialize the queued change sensor."""
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{self.entry.entry_id}-queued-temp"
 
     @property
     def native_value(self):
-        """Return string describing queued temperature change state."""
+        """Return string describing queued change state; 'none' when no ops pending (complete)."""
         api = self.coordinator.api
         pending = getattr(api, "_pending_writes", {})
         info = self.coordinator.data or {}
 
-        def fmt(payload: dict[str, Any], kind: str) -> str:
+        def fmt_temp(payload: dict[str, Any], kind: str) -> str:
             direction = payload.get("direction") or "up"
             requested = payload.get("temp") or payload.get("requested_temp")
             base = f"{kind}:{direction}"
@@ -303,7 +303,7 @@ class QueuedTemperatureChangeSensor(RheemEziSETEntity, SensorEntity):
             flow_val = to_float(info.get("flow"))
             mode_val = to_int(info.get("mode"))
             s_timeout = to_int(info.get("sTimeout"))
-            bathfill = bool((to_int(info.get("mode")) in {20, 25, 30, 35}) or is_one(info.get("bathfillCtrl")))
+            bathfill = bool((to_int(info.get("mode")) in BATHFILL_MODES) or is_one(info.get("bathfillCtrl")))
             reason_parts = []
             if s_timeout not in (0, None):
                 reason_parts.append("sTimeout")
@@ -317,10 +317,37 @@ class QueuedTemperatureChangeSensor(RheemEziSETEntity, SensorEntity):
                 return f"{base}:waiting({','.join(reason_parts)})"
             return f"{base}:applying"
 
+        def fmt_bathfill_start() -> str:
+            flow_val = to_float(info.get("flow"))
+            mode_val = to_int(info.get("mode"))
+            s_timeout = to_int(info.get("sTimeout"))
+            bathfill = bool((to_int(info.get("mode")) in BATHFILL_MODES) or is_one(info.get("bathfillCtrl")))
+            reason_parts = []
+            if bathfill:
+                reason_parts.append("bathfill_already_active")
+            if s_timeout not in (0, None):
+                reason_parts.append("sTimeout_active")
+            if flow_val not in (0, None):
+                reason_parts.append("flow_active")
+            if mode_val not in (5, None):
+                reason_parts.append(f"mode_busy_{mode_val}")
+            if reason_parts:
+                return f"bathfill_start:waiting({','.join(reason_parts)})"
+            return "bathfill_start:applying"
+
+        # Report first pending op in drain order
+        if "bathfill_cancel" in pending:
+            return "bathfill_cancel:applying"
         if "bathfill_set_temp" in pending:
-            return fmt(pending["bathfill_set_temp"], "setBathTemp")
+            return fmt_temp(pending["bathfill_set_temp"], "setBathTemp")
+        if "bathfill_start" in pending:
+            return fmt_bathfill_start()
+        if "set_session_timer" in pending:
+            return "set_session_timer:applying"
         if "set_temp" in pending:
-            return fmt(pending["set_temp"], "set_temp")
+            return fmt_temp(pending["set_temp"], "set_temp")
+        if "restore_temp" in pending:
+            return "restore_temp:applying"
         return "none"
 
 

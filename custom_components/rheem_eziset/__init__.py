@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_HOST, CONF_ICON, CONF_ID, CONF_NAME, CONF_OPTIONS
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -31,6 +31,30 @@ from .const import (
 )
 from .coordinator import RheemEziSETDataUpdateCoordinator
 from .util import to_int
+
+
+def _resolve_input_select_entity_id_after_add(
+    hass: HomeAssistant,
+    domain: str,
+    object_id: str,
+    base_entity_id: str,
+) -> str | None:
+    """Resolve the actual entity_id HA assigned (may have suffix e.g. _2). Returns None if not found."""
+    prefix = f"{domain}.{object_id}"
+    # Prefer entity registry: find entry with our object_id base
+    ent_reg = er.async_get(hass)
+    for ent_id in ent_reg.entities:
+        if not ent_id.startswith(prefix):
+            continue
+        # entity_id is prefix or prefix + "_N"
+        if hass.states.get(ent_id):
+            return ent_id
+    # Fallback: scan states for domain.object_id*
+    for state in hass.states.async_all(domain):
+        eid = state.entity_id
+        if eid.startswith(prefix) and (eid == prefix or eid[len(prefix) :].startswith("_")):
+            return eid
+    return None
 
 
 def _get_input_select_storage_collection(hass: HomeAssistant, domain: str):
@@ -395,10 +419,23 @@ async def _ensure_bath_profile_input_select(
                 await component.async_add_entities([input_select_entity], update_before_add=True)
                 LOGGER.info("%s - Created input_select entity via InputSelect.from_yaml: %s", DOMAIN, entity_id)
                 
-                # Verify entity was actually created and is accessible
+                # Verify entity was actually created and is accessible (HA may assign suffixed entity_id e.g. _2)
                 for verify_attempt in range(10):
                     await asyncio.sleep(0.3)
                     verify_state = hass.states.get(entity_id)
+                    if not verify_state and verify_attempt >= 2:
+                        # Resolve actual entity_id in case HA assigned a suffix
+                        resolved_id = _resolve_input_select_entity_id_after_add(
+                            hass, INPUT_SELECT_DOMAIN, object_id, entity_id
+                        )
+                        if resolved_id and resolved_id != entity_id:
+                            entity_id = resolved_id
+                            verify_state = hass.states.get(entity_id)
+                            LOGGER.info(
+                                "%s - Resolved actual entity_id after add: %s",
+                                DOMAIN,
+                                entity_id,
+                            )
                     if verify_state:
                         LOGGER.info(
                             "%s - Verified entity exists in state machine: %s (attempt %d, state=%s)",
@@ -410,6 +447,18 @@ async def _ensure_bath_profile_input_select(
                         entity_created = True
                         break
                     elif verify_attempt == 9:
+                        resolved_id = _resolve_input_select_entity_id_after_add(
+                            hass, INPUT_SELECT_DOMAIN, object_id, entity_id
+                        )
+                        if resolved_id:
+                            entity_id = resolved_id
+                            entity_created = True
+                            LOGGER.info(
+                                "%s - Resolved actual entity_id after 10 attempts: %s",
+                                DOMAIN,
+                                entity_id,
+                            )
+                            break
                         LOGGER.error("%s - Entity created but not found in state machine after 10 attempts: %s", DOMAIN, entity_id)
                         all_input_selects = [s for s in hass.states.async_all() if s.entity_id.startswith("input_select.")]
                         LOGGER.warning("%s - All input_select entities found: %s", DOMAIN, [s.entity_id for s in all_input_selects])
@@ -562,7 +611,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = RheemEziSETDataUpdateCoordinator(hass, api=api, update_interval=scan_interval, config_entry=entry)
     try:
-        await coordinator.async_config_entry_first_refresh()
+        if entry.state == ConfigEntryState.SETUP_IN_PROGRESS:
+            await coordinator.async_config_entry_first_refresh()
+        else:
+            # Reload: entry is already LOADED; first refresh only valid during initial setup
+            await coordinator.async_refresh()
     except Exception as err:  # pylint: disable=broad-except
         LOGGER.warning("%s - Initial refresh failed: %s. Proceeding to register entry so Options/UI remain usable. Will retry in background.", DOMAIN, err)
         # Ensure platforms can still set up even if the first refresh failed.

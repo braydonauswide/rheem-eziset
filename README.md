@@ -151,6 +151,14 @@ Steps:
 - Turn **OFF** the **Bath Fill** switch, or use **Exit Bath Fill** (momentary switch).
 - Safety: exiting bath fill may allow hot water to resume if a tap is open—close the tap first.
 
+### End bath (with power fallback)
+
+If the heater is unreachable or times out, the API cancel may fail and the bath keeps running. The **End Bath (with fallback)** script tries the API cancel first, then after a delay falls back to cutting power via your hot water switch (e.g. `switch.rheem_hot_water`) and optionally restores power.
+
+- **Script**: `script.end_bath_with_fallback` (from `config/scripts.yaml`; add `script: !include scripts.yaml` to `configuration.yaml` if you use the sample config).
+- **Variables**: `bath_fill_entity_id` (your Bath Fill switch, e.g. `switch.rheem_eziset_xxxx_bath_fill`), `hot_water_switch_entity_id` (your hot water power switch, e.g. `switch.rheem_hot_water`). Leave `hot_water_switch_entity_id` empty to skip the power fallback.
+- **UI button**: Call `script.turn_on` with `entity_id: script.end_bath_with_fallback` and `variables`: `bath_fill_entity_id: <your_bath_fill_entity>`, `hot_water_switch_entity_id: switch.rheem_hot_water` (or leave empty to skip power fallback). Find your Bath Fill entity_id in **Developer Tools → States** or on the device card.
+
 ## Manage bath fill presets via services (recommended)
 
 Use HA Services (Developer Tools → Services) instead of Options UI:
