@@ -141,6 +141,7 @@ class RheemEziSETApi:
         self._last_release_attempt: float = 0.0
         self._completion_latched: bool = False
         self._bathfill_latched: bool = False
+        self._bathfill_accepted: bool = False
         # When True, treat completion markers (state==3 / mode==35) as cleared until the next bath fill start.
         # Some devices keep reporting "Bath Fill Complete" for a long time after exit.
         self._ignore_completion_state: bool = False
@@ -238,21 +239,41 @@ class RheemEziSETApi:
             if stored_sid is None:
                 return None
             
-            # Validate session is still active (check device state)
-            info = await self._enqueue_request("getInfo.cgi")
+            # Validate session is still active using sid-aware getInfo
+            info: dict[str, Any] | None = None
+            try:
+                info = await self._enqueue_request(f"getInfo.cgi?sid={stored_sid}")
+            except Exception as err:  # pylint: disable=broad-except
+                LOGGER.debug("%s - sid-aware validation for stored sid %s failed (%s)", DOMAIN, stored_sid, err)
+                info = None
+
+            # If we got no info or the payload is incomplete (e.g., missing mode), treat as indeterminate:
+            # keep storage intact and retry later.
+            if not info or info.get("mode") is None:
+                LOGGER.debug("%s - Stored sid %s validation indeterminate (missing mode); keeping for retry", DOMAIN, stored_sid)
+                return None
+
             current_sid = to_int(info.get("sid"))
             s_timeout = to_int(info.get("sTimeout"))
-            
-            # Session is valid if device reports the same sid
-            if current_sid == stored_sid:
+            bathfill_ctrl = info.get("bathfillCtrl")
+
+            # Session is valid if device reports same sid OR indicates bath fill control/session activity.
+            if current_sid == stored_sid or is_one(bathfill_ctrl) or s_timeout not in (0, None):
                 self._owned_sid = stored_sid
                 LOGGER.info("%s - Restored session ID %s from storage", DOMAIN, stored_sid)
                 return stored_sid
-            else:
-                # Session expired - clear it
-                LOGGER.debug("%s - Stored session ID %s is no longer valid (current_sid=%s, sTimeout=%s)", DOMAIN, stored_sid, current_sid, s_timeout)
-                await self._save_session_id(entry, None)
-                return None
+
+            # Session appears invalid; clear it.
+            LOGGER.debug(
+                "%s - Stored session ID %s no longer valid (current_sid=%s, sTimeout=%s, bathfillCtrl=%s); clearing",
+                DOMAIN,
+                stored_sid,
+                current_sid,
+                s_timeout,
+                bathfill_ctrl,
+            )
+            await self._save_session_id(entry, None)
+            return None
         except Exception as err:
             LOGGER.debug("%s - Failed to restore session ID: %s", DOMAIN, err)
             return None
@@ -1100,13 +1121,14 @@ class RheemEziSETApi:
             LOGGER.info("%s - Operating in degraded mode: endpoints %s are failing but using cached data", DOMAIN, degraded_endpoints)
 
         # If we still "own" a control session, ensure we release it even if a prior release timed out.
+        # Do NOT attempt release if bath fill is engaged (active, completion markers, or latched).
         if self._owned_sid and not self._write_lock.locked():
             sid_from_info = to_int(merged.get("sid"))
             s_timeout_val = to_int(merged.get("sTimeout"))
             mode_val = to_int(merged.get("mode"))
-            bathfill_active = self._bathfill_active(merged)
+            bathfill_engaged = self._bathfill_engaged(merged)
             now_mono = time.monotonic()
-            if not bathfill_active and now_mono - self._last_release_attempt > 1.0:
+            if not bathfill_engaged and now_mono - self._last_release_attempt > 1.0:
                 if mode_val == 10 or s_timeout_val not in (0, None) or sid_from_info in (self._owned_sid, 0, None):
                     self._last_release_attempt = now_mono
                     resp: dict[str, Any] | None = None
@@ -1118,12 +1140,8 @@ class RheemEziSETApi:
                         )
                     if resp is not None and not resp.get("_timeout"):
                         self._owned_sid = None
-                        # Clear from storage
                         if self._config_entry:
                             await self._save_session_id(self._config_entry, None)
-                # Clear from storage
-                if self._config_entry:
-                    await self._save_session_id(self._config_entry, None)
 
         # If bath fill not active anymore, allow temp changes again.
         if not self._bathfill_active(info):
@@ -1236,6 +1254,7 @@ class RheemEziSETApi:
                     merged["fillPercent"] = 0.0
                     self._completion_latched = False
                     self._bathfill_latched = False
+                    self._bathfill_accepted = False
                     # Clear fill percent tracking when bath fill is not active
                     self._last_fill_percent = None
                     self._last_fill_percent_timestamp = 0.0
@@ -2024,11 +2043,13 @@ class RheemEziSETApi:
         prev_bathfill_latched = self._bathfill_latched
         prev_completion_latched = self._completion_latched
         prev_ignore_completion = self._ignore_completion_state
+        prev_bathfill_accepted = self._bathfill_accepted
         try:
             self._cancel_user_settemp = True
             self._bathfill_latched = True
             self._completion_latched = False
             self._ignore_completion_state = False
+            self._bathfill_accepted = False
             self._prev_temp_for_bathfill = to_int(data.get("temp"))
             self._pending_restore_temp = self._prev_temp_for_bathfill
 
@@ -2049,6 +2070,7 @@ class RheemEziSETApi:
                     else:
                         LOGGER.warning("%s - No config_entry reference; session ID %s not persisted", DOMAIN, self._owned_sid)
                     self._last_info = resp
+                    self._bathfill_accepted = True
                 else:
                     # Minimal response (sid=0, no bathfillCtrl): device may still have accepted; treat as uncertain
                     LOGGER.info(
@@ -2068,6 +2090,7 @@ class RheemEziSETApi:
                                         LOGGER.info("%s - Confirmed bath fill started via getInfo, sid=%s", DOMAIN, self._owned_sid)
                                     except Exception as err:
                                         LOGGER.debug("%s - Failed to save session ID from getInfo: %s", DOMAIN, err)
+                            self._bathfill_accepted = True
                         else:
                             self._last_info = resp
                     except Exception:
@@ -2085,19 +2108,6 @@ class RheemEziSETApi:
                 control_seq_id="bathfill_start",
                 extra={"origin": origin or "user", "entity_id": entity_id, "temp": temp, "vol": vol, "post": self._snapshot_state()},
             )
-            try:
-                refreshed = await self._enqueue_request("getInfo.cgi")
-                if refreshed:
-                    self._last_info = refreshed
-                    # Ensure fillPercent is 0.0 at start (device may report stale value)
-                    if isinstance(self._last_info, dict):
-                        # Only reset if device hasn't started filling yet (flow=0)
-                        flow_val = to_float(self._last_info.get("flow"))
-                        if flow_val in (0, None):
-                            self._last_info["fillPercent"] = 0.0
-            except Exception:
-                # Best-effort; continue even if refresh fails.
-                pass
         except Exception:
             self._cancel_user_settemp = prev_cancel
             self._prev_temp_for_bathfill = prev_prev_temp
@@ -2106,6 +2116,7 @@ class RheemEziSETApi:
             self._bathfill_latched = prev_bathfill_latched
             self._completion_latched = prev_completion_latched
             self._ignore_completion_state = prev_ignore_completion
+            self._bathfill_accepted = prev_bathfill_accepted
             self._log_action(
                 "bathfill_start",
                 "error",
@@ -2154,6 +2165,7 @@ class RheemEziSETApi:
                 self._last_fill_percent = None
                 self._last_fill_percent_timestamp = 0.0
                 self._owned_sid = None
+                self._bathfill_accepted = False
             # Clear from storage
             if self._config_entry:
                 await self._save_session_id(self._config_entry, None)
@@ -2230,6 +2242,7 @@ class RheemEziSETApi:
                         self._last_fill_percent = None
                         self._last_fill_percent_timestamp = 0.0
                         self._owned_sid = None
+                        self._bathfill_accepted = False
                     # Clear from storage
                     if self._config_entry:
                         await self._save_session_id(self._config_entry, None)
@@ -2325,28 +2338,43 @@ class RheemEziSETApi:
             # AGENTS.md findings: device needs ~1.0s for temp changes, but exit commands are faster
             # Use minimal delay (0.2s) - just enough for device to process, then poll immediately
             await asyncio.sleep(0.2)
-            # Single confirmation poll; if still active, retry later.
-            safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info")
+            # Single confirmation poll; prefer sid-aware when we have one.
+            try:
+                if sid not in (None, 0):
+                    safe_info = await self._enqueue_request(f"getInfo.cgi?sid={sid}", control_seq_id="post_exit_info")
+                else:
+                    safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info")
+            except Exception:
+                # Fallback to sid-less poll if sid-aware fails
+                safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info")
             self._last_info = safe_info
             
-            # Check if exit was successful by looking at bathfillCtrl in the response
-            # If bathfillCtrl is 0 (or not 1), the exit command was accepted even if mode is still 35
-            # The device may report mode 35 (completion) briefly after exit, but bathfillCtrl=0 confirms exit
             safe_bathfill_ctrl = safe_info.get("bathfillCtrl")
             safe_mode = to_int(safe_info.get("mode"))
+            safe_state = to_int(safe_info.get("state"))
+
+            # Treat missing bathfillCtrl as unknown if device still looks like completion.
+            if safe_bathfill_ctrl is None and (safe_mode in BATHFILL_MODES or safe_state == 3):
+                LOGGER.warning(
+                    "%s - Exit confirmation missing bathfillCtrl while device reports bath fill/completion (mode=%s, state=%s); will retry",
+                    DOMAIN,
+                    safe_mode,
+                    safe_state,
+                )
+                raise ConditionErrorMessage(
+                    type="bathfill_exit_retry",
+                    message=f"{DOMAIN} - Bath fill exit confirmation inconclusive; will retry.",
+                )
+
             exit_confirmed_in_poll = safe_bathfill_ctrl in (0, None, False) or not is_one(safe_bathfill_ctrl)
-            
-            # Exit is successful if bathfillCtrl is 0 (or not 1) - this is the authoritative indicator
-            # Mode 35 may persist briefly, but bathfillCtrl=0 means the device accepted the exit
+
+            # Exit is successful if bathfillCtrl is not 1, or device not in bath fill/completion.
             if exit_confirmed_in_poll:
-                # Exit successful - device accepted the exit command (bathfillCtrl is 0)
-                LOGGER.info("%s - Bath fill exit confirmed: bathfillCtrl=%s, mode=%s", DOMAIN, safe_bathfill_ctrl, safe_mode)
-            elif safe_mode not in BATHFILL_MODES:
-                # Device is not in bath fill mode - exit successful
-                LOGGER.info("%s - Bath fill exit confirmed: device not in bath fill mode (mode=%s)", DOMAIN, safe_mode)
+                LOGGER.info("%s - Bath fill exit confirmed: bathfillCtrl=%s, mode=%s, state=%s", DOMAIN, safe_bathfill_ctrl, safe_mode, safe_state)
+            elif safe_mode not in BATHFILL_MODES and safe_state != 3:
+                LOGGER.info("%s - Bath fill exit confirmed: device not in bath fill mode (mode=%s, state=%s)", DOMAIN, safe_mode, safe_state)
             else:
-                # Device still active (bathfillCtrl=1 and mode in bath fill modes) - retry needed
-                LOGGER.warning("%s - Bath fill still active after cancel: bathfillCtrl=%s, mode=%s", DOMAIN, safe_bathfill_ctrl, safe_mode)
+                LOGGER.warning("%s - Bath fill still active after cancel: bathfillCtrl=%s, mode=%s, state=%s", DOMAIN, safe_bathfill_ctrl, safe_mode, safe_state)
                 raise ConditionErrorMessage(
                     type="bathfill_exit_retry",
                     message=f"{DOMAIN} - Bath fill still active after cancel; will retry.",
@@ -2362,6 +2390,7 @@ class RheemEziSETApi:
             self._bathfill_target_vol = None
             self._last_fill_percent = None
             self._last_fill_percent_timestamp = 0.0
+            self._bathfill_accepted = False
 
             # Restore previous temperature if one was saved before bath fill started
             # OPTIMIZATION: Check sTimeout before attempting restore - if device still has active session,

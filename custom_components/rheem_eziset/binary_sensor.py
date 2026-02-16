@@ -23,6 +23,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
     binary_sensors = [RheemEziSETBinarySensor(coordinator, entry, description, key, icon, device_class, entity_category) for description, key, icon, device_class, entity_category in BINARY_SENSOR_MAP]
     binary_sensors.append(RheemEziSETProblemBinarySensor(coordinator, entry))
     binary_sensors.append(CanIncreaseTemperatureNowSensor(coordinator, entry))
+    binary_sensors.append(BathFillAcceptedSensor(coordinator, entry))
 
     async_add_devices(binary_sensors, True)
 
@@ -118,3 +119,21 @@ class CanIncreaseTemperatureNowSensor(RheemEziSETEntity, BinarySensorEntity):
 
         # Normal heater temp increase path
         return s_timeout in (0, None) and flow_val in (0, None) and mode_val in (5, None)
+
+
+class BathFillAcceptedSensor(RheemEziSETEntity, BinarySensorEntity):
+    """Binary sensor indicating controller has accepted bath fill (ready to open tap)."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = None
+    _attr_name = "Bath fill accepted"
+
+    def __init__(self, coordinator: RheemEziSETDataUpdateCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the accepted indicator."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{self.entry.entry_id}-bathfill-accepted"
+
+    @property
+    def is_on(self) -> bool:
+        """Return True when bath fill start was accepted and pending/filling."""
+        return bool(getattr(self.coordinator.api, "_bathfill_accepted", False))
