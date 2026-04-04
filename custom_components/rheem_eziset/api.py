@@ -482,15 +482,18 @@ class RheemEziSETApi:
 
     def _op_ready(self, op: str, payload: dict[str, Any], info: Mapping[str, Any]) -> tuple[bool, str | None, bool]:
         """Return (ready, reason, drop) for a pending op given cached info."""
+        if op == "bathfill_cancel":
+            # Allow cancel to execute even if not currently engaged; executor is idempotent.
+            # Must be checked BEFORE write_lock guard so mode 99 (bath fill exit sequence)
+            # cannot block the cancel operation.
+            return True, None, False
+
         if self._write_lock.locked():
             return False, "write_lock_in_use", False
 
         mode_val = to_int(info.get("mode"))
         flow_val = to_float(info.get("flow"))
         s_timeout = to_int(info.get("sTimeout"))
-        if op == "bathfill_cancel":
-            # Allow cancel to execute even if not currently engaged; executor is idempotent.
-            return True, None, False
 
         if op == "bathfill_set_temp":
             if not self._bathfill_active(info):
@@ -728,6 +731,7 @@ class RheemEziSETApi:
         req_id = self._req_counter = self._req_counter + 1
         now = time.monotonic()
         if self._lockout_until_monotonic and now < self._lockout_until_monotonic:
+            self._ignore_completion_state = True
             raise HomeAssistantError(
                 f"{DOMAIN} - Device lockout suspected; backing off until {self._lockout_until_monotonic}"
             )
@@ -1250,7 +1254,7 @@ class RheemEziSETApi:
             # Only clear latches if there's no pending start and no active session
             # This preserves latches during the startup window until device enters bath fill mode
             if not bathfill_start_pending and not has_bathfill_session:
-                if mode_val in (5, None) and flow_val in (0, None):
+                if mode_val not in BATHFILL_MODES and flow_val in (0, None):
                     merged["fillPercent"] = 0.0
                     self._completion_latched = False
                     self._bathfill_latched = False
@@ -1484,7 +1488,7 @@ class RheemEziSETApi:
             return False
         mode_val = to_int(data.get("mode"))
         state_val = to_int(data.get("state"))
-        return bool(mode_val == 35 or state_val == 3)
+        return bool(mode_val == 35 or (state_val == 3 and mode_val in BATHFILL_MODES))
 
     async def async_set_temp(
         self,
@@ -2216,6 +2220,7 @@ class RheemEziSETApi:
             while flow_val not in (0, None):
                 elapsed = time.monotonic() - start_time
                 if elapsed >= max_wait_s:
+                    self._ignore_completion_state = True
                     raise ConditionErrorMessage(
                         type="flow_active_timeout",
                         message=f"{DOMAIN} - Flow still active after {max_wait_s}s; cannot cancel bath fill until tap is closed (flow={flow_val} L/min).",
@@ -2308,11 +2313,13 @@ class RheemEziSETApi:
                     LOGGER.warning("%s - Reacquisition failed at completion, but allowing exit with sid=0 (sTimeout=%s)", DOMAIN, s_timeout)
                     sid = 0
                 elif s_timeout not in (0, None):
+                    self._ignore_completion_state = True
                     raise ConditionErrorMessage(
                         type="invalid_sTimeout",
                         message=f"{DOMAIN} - Cannot cancel bath fill: another controller holds session (sTimeout={s_timeout}).",
                     )
                 else:
+                    self._ignore_completion_state = True
                     raise ConditionErrorMessage(
                         type="invalid_session_id",
                         message=f"{DOMAIN} - Cannot cancel bath fill yet (sid missing); will retry.",
@@ -2348,19 +2355,33 @@ class RheemEziSETApi:
                 # Fallback to sid-less poll if sid-aware fails
                 safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info")
             self._last_info = safe_info
-            
+            # If sid-aware poll returned empty data (expired session), fall back to sid-less poll
+            if sid not in (None, 0) and safe_info.get("mode") is None:
+                LOGGER.debug(
+                    "%s - Exit confirmation sid-poll returned empty data (expired session sid=%s); retrying sid-less",
+                    DOMAIN, sid,
+                )
+                try:
+                    safe_info = await self._enqueue_request("getInfo.cgi", control_seq_id="post_exit_info_sidless")
+                    self._last_info = safe_info
+                except Exception:
+                    pass  # keep empty safe_info if fallback also fails
+
             safe_bathfill_ctrl = safe_info.get("bathfillCtrl")
             safe_mode = to_int(safe_info.get("mode"))
             safe_state = to_int(safe_info.get("state"))
 
-            # Treat missing bathfillCtrl as unknown if device still looks like completion.
-            if safe_bathfill_ctrl is None and (safe_mode in BATHFILL_MODES or safe_state == 3):
+            # Treat missing bathfillCtrl as unknown only if device is still actively in bath fill mode.
+            # Do NOT retry on state=3 alone -- state=3 ("Bath Fill Complete") persists indefinitely
+            # after the device exits bath fill (mode=99, appErrCode=10) and would cause infinite retries.
+            if safe_bathfill_ctrl is None and safe_mode in BATHFILL_MODES:
                 LOGGER.warning(
-                    "%s - Exit confirmation missing bathfillCtrl while device reports bath fill/completion (mode=%s, state=%s); will retry",
+                    "%s - Exit confirmation missing bathfillCtrl while device is still in bath fill mode (mode=%s, state=%s); will retry",
                     DOMAIN,
                     safe_mode,
                     safe_state,
                 )
+                self._ignore_completion_state = True
                 raise ConditionErrorMessage(
                     type="bathfill_exit_retry",
                     message=f"{DOMAIN} - Bath fill exit confirmation inconclusive; will retry.",
@@ -2375,6 +2396,7 @@ class RheemEziSETApi:
                 LOGGER.info("%s - Bath fill exit confirmed: device not in bath fill mode (mode=%s, state=%s)", DOMAIN, safe_mode, safe_state)
             else:
                 LOGGER.warning("%s - Bath fill still active after cancel: bathfillCtrl=%s, mode=%s, state=%s", DOMAIN, safe_bathfill_ctrl, safe_mode, safe_state)
+                self._ignore_completion_state = True
                 raise ConditionErrorMessage(
                     type="bathfill_exit_retry",
                     message=f"{DOMAIN} - Bath fill still active after cancel; will retry.",
@@ -2444,6 +2466,7 @@ class RheemEziSETApi:
                 control_seq_id="bathfill_exit",
                 extra={"origin": origin or "user", "entity_id": entity_id, "sid": sid, "owned_sid": self._owned_sid, "error": type(err).__name__},
             )
+            self._ignore_completion_state = True
             raise ConditionErrorMessage(
                 type="bathfill_cancel_retry",
                 message=f"{DOMAIN} - Cancel bath fill will retry ({type(err).__name__})",

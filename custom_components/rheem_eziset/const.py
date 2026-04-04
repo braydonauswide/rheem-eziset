@@ -45,6 +45,7 @@ CONST_MODE_MAP = {
     25: ("Heating (Bath Fill Mode)", "mdi:bathtub"),
     30: ("Heating (Bath Fill Mode - Flowing)", "mdi:bathtub"),
     35: ("Idle (Bath Fill Mode Complete)", "mdi:water-boiler-off"),
+    99: ("Transient Exit Mode (Bath Fill Exit Sequence)", "mdi:progress-clock"),
 }
 
 # Status Dictionary
