@@ -1418,6 +1418,12 @@ class RheemEziSETApi:
                         else:
                             ok = str(resp_val) == str(response_check)
                         if not ok:
+                            # Check for device-enforced temperature limit rejection (reqtemp==0 with a reason).
+                            # e.g. {"temp":43,"reqtemp":0,"reason":"Cannot set higher than 43 degC when water is flowing."}
+                            if response_param == "reqtemp" and to_int(resp_val) == 0:
+                                device_reason = set_resp.get("reason") or "Device rejected temperature change (reqtemp=0)"
+                                LOGGER.warning("%s - Temperature change rejected by device: %s (response: %s)", DOMAIN, device_reason, set_resp)
+                                raise HomeAssistantError(f"{DOMAIN} - {device_reason}")
                             LOGGER.error("%s - Error when setting %s. Response: %s", DOMAIN, param, set_resp)
                             raise HomeAssistantError(f"{DOMAIN} - Unable to set {param}")
                         # Success - clear control cooldowns to prevent delays on next operation
@@ -1720,32 +1726,24 @@ class RheemEziSETApi:
             raise ConditionErrorMessage(type="flow_active", message=f"{DOMAIN} - Flow active; will retry bath temp increase.")
 
         async def _do_request(sid_arg: int | None) -> dict[str, Any]:
+            # Use set.cgi for mid-session updates (iOS app uses set.cgi, not ctrl.cgi which is the START command)
             sid_q = sid_arg or 0
             resp = await self._enqueue_request(
-                f"ctrl.cgi?sid={sid_q}&bathfillCtrl=1&setBathTemp={temp}&setBathVol={vol_safe}",
+                f"set.cgi?sid={sid_q}&setBathTemp={temp}",
                 control_seq_id=control_seq_id or "bathfill_set_temp",
             )
             return resp
 
         try:
-            if sid in (None, 0) and can_reacquire:
-                resp = await _do_request(None)
-            else:
-                if sid in (None, 0):
-                    raise ConditionErrorMessage(type="invalid_session_id", message=f"{DOMAIN} - Missing bath fill session; will retry.")
-                resp = await _do_request(sid)
+            if sid in (None, 0):
+                raise ConditionErrorMessage(type="invalid_session_id", message=f"{DOMAIN} - Missing bath fill session; will retry.")
+            resp = await _do_request(sid)
 
             resp_sid = to_int(resp.get("sid"))
-            resp_ctrl = resp.get("bathfillCtrl")
-            if not resp_sid or not is_one(resp_ctrl):
-                raise ConditionErrorMessage(type="bathfill_set_temp_retry", message=f"{DOMAIN} - Bath temp update not accepted; will retry.")
-            try:
-                self._owned_sid = int(resp_sid)
-            except Exception:
-                self._owned_sid = None
-                # Clear from storage
-                if self._config_entry:
-                    await self._save_session_id(self._config_entry, None)
+            req_bath_temp = to_int(resp.get("reqbathtemp"))
+            if req_bath_temp is None or req_bath_temp == 0:
+                raise ConditionErrorMessage(type="bathfill_set_temp_retry", message=f"{DOMAIN} - Bath temp update not accepted (reqbathtemp={req_bath_temp}); will retry.")
+            # sid is unchanged for set.cgi — do not update self._owned_sid from this response
             self._last_info = resp
             self._bathfill_target_temp = temp
             self._log_action(
@@ -2207,14 +2205,67 @@ class RheemEziSETApi:
         mode_val = to_int(info.get("mode"))
         is_completion = mode_val == 35
         flow_val = to_float(info.get("flow"))
-        
+        app_err_code = to_int(info.get("appErrCode"))
+
+        # Fix I/J — mode=99/appErrCode=8 recovery (session expired during mode=35 window).
+        # iOS app sends exactly ONE call: clearAppError.cgi?bathfill=0, then waits for mode=5.
+        # A transient mode=99/appErrCode=64 flash occurs ~6s after clearAppError — must be ignored.
+        if mode_val == 99 and app_err_code == 8:
+            LOGGER.info("%s - Bath fill session expired (mode=99, appErrCode=8); sending clearAppError.cgi?bathfill=0", DOMAIN)
+            clear_resp = await self._enqueue_request("clearAppError.cgi?bathfill=0", control_seq_id="bathfill_clear_app_error")
+            self._last_info = clear_resp
+            LOGGER.info("%s - clearAppError response: %s; waiting for mode=5", DOMAIN, clear_resp)
+
+            # Poll for mode=5 (up to ~30s), ignoring transient mode=99/appErrCode=64 (Fix J)
+            _recovery_deadline = time.monotonic() + 30.0
+            while True:
+                await asyncio.sleep(1.0)
+                poll_resp = await self._enqueue_request("getInfo.cgi", control_seq_id="bathfill_recovery_poll")
+                self._last_info = poll_resp
+                poll_mode = to_int(poll_resp.get("mode"))
+                poll_err = to_int(poll_resp.get("appErrCode"))
+                # Ignore transient mode=99/appErrCode=64 — self-clears within one cycle
+                if poll_mode == 99 and poll_err == 64:
+                    LOGGER.debug("%s - Transient mode=99/appErrCode=64 during recovery — ignoring", DOMAIN)
+                    if time.monotonic() >= _recovery_deadline:
+                        LOGGER.warning("%s - Recovery timeout waiting for mode=5 after clearAppError", DOMAIN)
+                        break
+                    continue
+                if poll_mode == 5:
+                    LOGGER.info("%s - Device recovered to mode=5 after clearAppError", DOMAIN)
+                    info = poll_resp
+                    break
+                if time.monotonic() >= _recovery_deadline:
+                    LOGGER.warning("%s - Recovery timeout waiting for mode=5 after clearAppError (mode=%s)", DOMAIN, poll_mode)
+                    info = poll_resp
+                    break
+
+            # After recovery the bath fill session is gone — clear our session state and return.
+            self._owned_sid = None
+            if self._config_entry:
+                await self._save_session_id(self._config_entry, None)
+            self._bathfill_latched = False
+            self._completion_latched = False
+            self._ignore_completion_state = True
+            self._bathfill_target_temp = None
+            self._bathfill_target_vol = None
+            self._last_fill_percent = None
+            self._last_fill_percent_timestamp = 0.0
+            self._bathfill_accepted = False
+            self._cancel_user_settemp = False
+            self._log_action(
+                "bathfill_cancel",
+                "ok_via_clear_app_error",
+                control_seq_id="bathfill_exit",
+                extra={"origin": origin or "user", "entity_id": entity_id, "recovery_mode": to_int(info.get("mode"))},
+            )
+            return
+
         # Only wait for flow if not in completion mode (completion implies flow is already 0)
         if not is_completion:
-            # OPTIMIZATION: Reduce flow check interval from 30s to 5s for faster exit
-            # AGENTS.md findings: 1.0s polling is optimal, but flow checks can be less frequent
-            # Using 5s provides good balance between responsiveness and device load
+            # Poll at 1s intervals — matches iOS app polling rate for fast flow-zero detection
             max_wait_s = 3600  # Maximum 1 hour wait
-            poll_interval_s = 5.0  # Reduced from 30.0s - check every 5 seconds for faster exit
+            poll_interval_s = 1.0  # 1s matches iOS app polling rate
             start_time = time.monotonic()
 
             while flow_val not in (0, None):
@@ -2226,7 +2277,6 @@ class RheemEziSETApi:
                         message=f"{DOMAIN} - Flow still active after {max_wait_s}s; cannot cancel bath fill until tap is closed (flow={flow_val} L/min).",
                     )
 
-                # Wait 5 seconds before next check (reduced from 30s for faster exit)
                 await asyncio.sleep(poll_interval_s)
 
                 # Get fresh device state to check flow
@@ -2283,16 +2333,23 @@ class RheemEziSETApi:
             if sid == 0:
                 sid = None
 
+        # Gather bath_temp/bath_vol to include in exit command (iOS app always sends these on exit)
+        _exit_bath_temp = self._bathfill_target_temp or to_int(info.get("reqbathtemp")) or to_int(info.get("bathtemp"))
+        _exit_bath_vol = self._bathfill_target_vol or to_int(info.get("reqbathvol")) or to_int(info.get("bathvol"))
+
         if not sid:
             # Try to reacquire session and cancel, even if sTimeout is active
             # Some firmware allows bathfillCtrl=0 without session ID
             # At completion (mode 35), allow exit even if sTimeout is active (device is waiting for exit)
             # Use the earlier is_completion check (from line 2037) to avoid re-checking mode
             s_timeout = to_int(info.get("sTimeout"))
-            
+
             try:
                 # Try exit command with sid=0 first (some firmware allows this)
-                reacquire = await self._enqueue_request("ctrl.cgi?sid=0&bathfillCtrl=0", control_seq_id="bathfill_exit_reacquire")
+                _exit_q = "ctrl.cgi?sid=0&bathfillCtrl=0"
+                if _exit_bath_temp and _exit_bath_vol:
+                    _exit_q += f"&setBathTemp={_exit_bath_temp}&setBathVol={_exit_bath_vol}"
+                reacquire = await self._enqueue_request(_exit_q, control_seq_id="bathfill_exit_reacquire")
                 reacquire_sid = to_int(reacquire.get("sid"))
                 if reacquire_sid and reacquire_sid != 0:
                     sid = reacquire_sid
@@ -2333,7 +2390,10 @@ class RheemEziSETApi:
         )
         try:
             async with self._write_lock:
-                exit_resp = await self._enqueue_request(f"ctrl.cgi?sid={sid}&bathfillCtrl=0", control_seq_id="bathfill_exit")
+                _primary_exit_q = f"ctrl.cgi?sid={sid}&bathfillCtrl=0"
+                if _exit_bath_temp and _exit_bath_vol:
+                    _primary_exit_q += f"&setBathTemp={_exit_bath_temp}&setBathVol={_exit_bath_vol}"
+                exit_resp = await self._enqueue_request(_primary_exit_q, control_seq_id="bathfill_exit")
                 # Check if exit command response indicates success
                 # Some firmware may return bathfillCtrl=0 in response to confirm exit
                 exit_resp_bathfill_ctrl = exit_resp.get("bathfillCtrl")
