@@ -82,6 +82,12 @@ class RheemEziSETApi:
     REQUEST_TIMEOUT = ClientTimeout(total=25.0)
     LOCKOUT_CONSEC_FAILURES = 3
     COOLDOWN_SCHEDULE_S = [10, 30, 60, 180]
+    # Upper bound a queued control change may sit unexecuted before it is
+    # auto-reset to idle. Without a bound a permanently-blocked op (e.g. a
+    # bathfill_cancel the controller never accepts) stays in _pending_writes
+    # forever, pinning the fast-refresh loop and a UI "applying" state. A legit
+    # op normally clears within a few polls, so this only catches the stuck case.
+    PENDING_WRITE_TTL_S = 120.0
     # Optional recovery delay after very slow response to reduce back-to-back timeouts
     SLOW_RESPONSE_MS = 15_000
     SLOW_RESPONSE_EXTRA_DELAY_S = 3.0
@@ -135,6 +141,10 @@ class RheemEziSETApi:
         self._control_backoff_until: float = 0.0
         self._control_failures: int = 0
         self._pending_writes: dict[str, dict[str, Any]] = {}
+        # Monotonic deadline per queued op; past it the op is expired to idle
+        # (see _expire_stale_pending_writes) so a stuck write cannot pin the
+        # fast-refresh loop or a UI state indefinitely.
+        self._pending_write_deadlines: dict[str, float] = {}
         self._drain_lock = asyncio.Lock()
         self._drain_task: asyncio.Task | None = None
         self._post_write_callback: Callable[[str], Awaitable[None]] | None = None
@@ -462,8 +472,36 @@ class RheemEziSETApi:
         """Coalesce and enqueue a write operation (latest wins)."""
         replaced = op in self._pending_writes
         self._pending_writes[op] = payload
+        # Refresh the deadline on every (re)enqueue so a legitimately-updated op
+        # gets a fresh TTL and only a truly stuck op is expired.
+        self._pending_write_deadlines[op] = time.monotonic() + self.PENDING_WRITE_TTL_S
         self._queue_log("enqueue", op, extra={"replaced": replaced, "payload": self._payload_summary(payload)})
         self._schedule_drain()
+
+    def _expire_stale_pending_writes(self) -> None:
+        """Drop queued writes that have sat unexecuted past their TTL.
+
+        A queued control change can stay blocked when the device never reaches
+        the state the op needs (e.g. a bathfill_cancel the controller keeps
+        rejecting, or an op whose ready-condition never comes true). With no
+        bound it pins the fast-refresh loop and a UI "applying" state forever.
+        Expiring it returns the queue to idle within a bounded window so the
+        integration self-heals without a manual reload.
+        """
+        now = time.monotonic()
+        for op in list(self._pending_write_deadlines):
+            if op not in self._pending_writes:
+                # Op already completed or dropped elsewhere; prune its deadline.
+                self._pending_write_deadlines.pop(op, None)
+                continue
+            if now >= self._pending_write_deadlines[op]:
+                self._pending_writes.pop(op, None)
+                self._pending_write_deadlines.pop(op, None)
+                self._queue_log(
+                    "expired",
+                    op,
+                    extra={"reason": "pending_write_ttl", "ttl_s": self.PENDING_WRITE_TTL_S},
+                )
 
     def _schedule_drain(self) -> None:
         """Schedule draining pending writes if not already running."""
@@ -549,6 +587,9 @@ class RheemEziSETApi:
         async with self._drain_lock:
             try:
                 while True:
+                    # Bound the lifetime of queued writes: a permanently-blocked op
+                    # is expired to idle rather than pinning fast-refresh / UI state.
+                    self._expire_stale_pending_writes()
                     if not self._pending_writes:
                         self._queue_log("empty", "write_queue")
                         break
