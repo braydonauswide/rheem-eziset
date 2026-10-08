@@ -27,6 +27,10 @@ class RheemEziSETDataUpdateCoordinator(DataUpdateCoordinator):
         self.api = api
         self.platforms = []
         self._fast_refresh_task: asyncio.Task | None = None
+        # Connectivity-problem flag, owned by the coordinator and driven off poll
+        # success/failure (see _async_update_data). binary_sensor.rheem_connectivity_problem
+        # reads this; it must reflect the latest poll result, not an entity-side side effect.
+        self.problem_flag: bool = False
         self.api.set_post_write_callback(self._post_write_refresh)
 
         super().__init__(
@@ -41,10 +45,19 @@ class RheemEziSETDataUpdateCoordinator(DataUpdateCoordinator):
         """Update basic data via client."""
         try:
             result = await self.api.async_get_data()
-            LOGGER.debug("%s - Fetched data: %s", DOMAIN, result)
-            return result
         except Exception as exception:
+            # Device unreachable / poll failed: surface it immediately. Flag the
+            # connectivity problem and fail the update so all entities go
+            # unavailable within ~1 poll interval instead of showing the last
+            # known values as if they were live.
+            self.problem_flag = True
             raise UpdateFailed(str(exception)) from exception
+        # Success: the device responded, so clear the connectivity-problem flag.
+        # The connectivity_problem binary sensor turns off and entities recover
+        # with fresh values on this scheduled poll — no manual reload required.
+        self.problem_flag = False
+        LOGGER.debug("%s - Fetched data: %s", DOMAIN, result)
+        return result
 
     async def _post_write_refresh(self, reason: str) -> None:
         """Fast refresh after a queued write succeeds."""
